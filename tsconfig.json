@@ -10,7 +10,9 @@
     "rootDir": "./src",
     "declaration": true,
     "skipLibCheck": true,
-    "types": ["bun-types"]
+    "types": ["bun-types"],
+    "jsx": "preserve",
+    "jsxImportSource": "@opentui/solid"
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "dist"]

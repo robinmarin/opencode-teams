@@ -1,11 +1,12 @@
 {
   "name": "@robinmarin/opencode-teams",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "OpenCode plugin — spawn and coordinate sub-agent teams from your lead session",
   "type": "module",
   "main": "./dist/index.js",
   "exports": {
-    ".": "./dist/index.js"
+    ".": "./dist/index.js",
+    "./tui": "./dist/tui.jsx"
   },
   "files": [
     "dist"
@@ -32,6 +33,8 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.10",
+    "@opentui/core": "^0.1.96",
+    "@opentui/solid": "^0.1.96",
     "bun-types": "^1.3.11",
     "typescript": "^6.0.2"
   }
