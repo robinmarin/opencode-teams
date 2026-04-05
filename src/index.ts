@@ -1,4 +1,4 @@
-import type { Plugin, PluginModule } from "@opencode-ai/plugin";
+import type { Plugin } from "@opencode-ai/plugin";
 import { createEventHandler } from "./messaging.js";
 import { createTools } from "./tools.js";
 

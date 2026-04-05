@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createEventHandler } from "../src/messaging.js";
-import { readTeam, setTestTeamsDir, writeTeam } from "../src/state.js";
+import { getEvents, readTeam, setTestTeamsDir, writeTeam } from "../src/state.js";
 
 let tmpDir: string;
 
@@ -127,11 +127,17 @@ describe("createEventHandler", () => {
       event: { type: "session.idle", properties: { sessionID: "carol-sess" } },
     });
 
-    // Two calls: 1) notification that carol completed, 2) team status render
-    expect(calls.length).toBe(2);
-    const notificationCall = calls.find((c) => c.text.includes("completed a work cycle"));
-    expect(notificationCall?.sessionId).toBe("gamma-lead");
-    expect(notificationCall?.text).toContain("carol");
+    // One call: team status render (notification now goes to channel instead)
+    expect(calls.length).toBe(1);
+    const statusCall = calls[0];
+    expect(statusCall.sessionId).toBe("gamma-lead");
+
+    // Verify channel event was created
+    const { events } = await getEvents("gamma", 10);
+    const statusEvent = events.find((e) => e.type === "status" && e.sender === "carol");
+    expect(statusEvent).toBeDefined();
+    expect(statusEvent?.content).toContain("carol");
+    expect(statusEvent?.content).toContain("ready");
   });
 
   it("does NOT notify lead when a ready member goes idle", async () => {

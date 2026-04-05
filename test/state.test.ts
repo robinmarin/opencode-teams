@@ -3,11 +3,14 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  appendEvent,
   claimTask,
   completeTask,
   findTeamBySession,
+  getEvents,
   listTeams,
   markStaleMembersAsError,
+  pruneEvents,
   readTeam,
   setTestTeamsDir,
   updateMember,
@@ -332,5 +335,87 @@ describe("listTeams", () => {
     await writeTeam(makeTeam({ name: "team-b" }));
     const teams = await listTeams();
     expect(teams.sort()).toEqual(["team-a", "team-b"]);
+  });
+});
+
+describe("appendEvent + getEvents", () => {
+  it("appends and retrieves events", async () => {
+    await writeTeam(makeTeam({ name: "channel-team" }));
+    const evt = await appendEvent("channel-team", {
+      type: "message",
+      sender: "alice",
+      senderId: "sess-alice",
+      content: "Hello team!",
+    });
+    expect(evt.id).toBeDefined();
+    expect(evt.type).toBe("message");
+    expect(evt.content).toBe("Hello team!");
+
+    const { events } = await getEvents("channel-team", 10);
+    expect(events.length).toBe(1);
+    expect(events[0].content).toBe("Hello team!");
+  });
+
+  it("returns events with mentions", async () => {
+    await writeTeam(makeTeam({ name: "mention-team" }));
+    const evt = await appendEvent("mention-team", {
+      type: "message",
+      sender: "bob",
+      senderId: "sess-bob",
+      content: "Hey @alice!",
+      mentions: ["alice"],
+    });
+    expect(evt.mentions).toEqual(["alice"]);
+
+    const { events } = await getEvents("mention-team", 10);
+    expect(events[0].mentions).toEqual(["alice"]);
+  });
+
+  it("respects limit parameter", async () => {
+    await writeTeam(makeTeam({ name: "limit-team" }));
+    for (let i = 0; i < 5; i++) {
+      await appendEvent("limit-team", {
+        type: "message",
+        sender: "charlie",
+        senderId: `sess-${i}`,
+        content: `Message ${i}`,
+      });
+    }
+
+    const { events } = await getEvents("limit-team", 3);
+    expect(events.length).toBe(3);
+  });
+
+  it("returns empty for nonexistent team", async () => {
+    const { events } = await getEvents("nonexistent", 10);
+    expect(events).toEqual([]);
+  });
+});
+
+describe("pruneEvents", () => {
+  it("prunes old events keeping recent ones", async () => {
+    await writeTeam(makeTeam({ name: "prune-team" }));
+    for (let i = 0; i < 10; i++) {
+      await appendEvent("prune-team", {
+        type: "message",
+        sender: "dan",
+        senderId: `sess-${i}`,
+        content: `Message ${i}`,
+      });
+    }
+
+    const { pruned, remaining } = await pruneEvents("prune-team", 5);
+    expect(pruned).toBe(5);
+    expect(remaining).toBe(5);
+
+    const { events } = await getEvents("prune-team", 10);
+    expect(events.length).toBe(5);
+  });
+
+  it("returns zeros when no events to prune", async () => {
+    await writeTeam(makeTeam({ name: "small-team" }));
+    const { pruned, remaining } = await pruneEvents("small-team", 100);
+    expect(pruned).toBe(0);
+    expect(remaining).toBe(0);
   });
 });

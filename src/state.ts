@@ -40,6 +40,27 @@ export type TeamConfig = {
   createdAt: string;
 };
 
+export type ChannelEventType =
+  | "message"
+  | "status"
+  | "task"
+  | "reaction"
+  | "system";
+
+export type ChannelEvent = {
+  id: string;
+  type: ChannelEventType;
+  sender: string;
+  senderId: string;
+  content: string;
+  timestamp: string;
+  mentions?: string[];
+  reaction?: string;
+  targetId?: string;
+};
+
+export const MAX_EVENTS_LINES = 1000;
+
 // ---------------------------------------------------------------------------
 // Paths
 // ---------------------------------------------------------------------------
@@ -90,7 +111,10 @@ function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
 // that populates the index as a side effect, making subsequent lookups O(1).
 // ---------------------------------------------------------------------------
 
-const sessionIndex = new Map<string, { teamName: string; memberName: string }>();
+const sessionIndex = new Map<
+  string,
+  { teamName: string; memberName: string }
+>();
 
 function indexTeam(config: TeamConfig): void {
   // Remove any stale entries for this team before re-indexing
@@ -182,7 +206,8 @@ export async function findTeamBySession(
     if (team === null) continue;
     indexTeam(team);
 
-    if (team.leadSessionId === sessionId) return { team, memberName: "__lead__" };
+    if (team.leadSessionId === sessionId)
+      return { team, memberName: "__lead__" };
     for (const [memberName, member] of Object.entries(team.members)) {
       if (member.sessionId === sessionId) return { team, memberName };
     }
@@ -203,10 +228,16 @@ export async function claimTask(
 
     const task = config.tasks[taskId];
     if (task === undefined) {
-      return { ok: false, reason: `Task "${taskId}" not found in team "${teamName}".` };
+      return {
+        ok: false,
+        reason: `Task "${taskId}" not found in team "${teamName}".`,
+      };
     }
     if (task.status !== "pending") {
-      return { ok: false, reason: `Task "${taskId}" is not pending (current status: "${task.status}").` };
+      return {
+        ok: false,
+        reason: `Task "${taskId}" is not pending (current status: "${task.status}").`,
+      };
     }
 
     const blocking: string[] = [];
@@ -223,7 +254,11 @@ export async function claimTask(
       };
     }
 
-    config.tasks[taskId] = { ...task, status: "in_progress", assignee: memberName };
+    config.tasks[taskId] = {
+      ...task,
+      status: "in_progress",
+      assignee: memberName,
+    };
     const tmpPath = `${configPath}.tmp`;
     await fs.writeFile(tmpPath, JSON.stringify(config, null, 2), "utf-8");
     await fs.rename(tmpPath, configPath);
@@ -238,7 +273,9 @@ export async function claimTask(
 export async function completeTask(
   teamName: string,
   taskId: string,
-): Promise<{ ok: true; unblockedTaskIds: string[] } | { ok: false; reason: string }> {
+): Promise<
+  { ok: true; unblockedTaskIds: string[] } | { ok: false; reason: string }
+> {
   return withLock(teamName, async () => {
     const configPath = teamConfigPath(teamName);
     const raw = await fs.readFile(configPath, "utf-8");
@@ -246,7 +283,10 @@ export async function completeTask(
 
     const task = config.tasks[taskId];
     if (task === undefined) {
-      return { ok: false, reason: `Task "${taskId}" not found in team "${teamName}".` };
+      return {
+        ok: false,
+        reason: `Task "${taskId}" not found in team "${teamName}".`,
+      };
     }
 
     config.tasks[taskId] = { ...task, status: "completed" };
@@ -287,7 +327,10 @@ export async function markStaleMembersAsError(
     }
     const config = JSON.parse(raw) as TeamConfig;
 
-    const recovered: Array<{ memberName: string; previousStatus: MemberStatus }> = [];
+    const recovered: Array<{
+      memberName: string;
+      previousStatus: MemberStatus;
+    }> = [];
     let dirty = false;
     for (const [name, member] of Object.entries(config.members)) {
       if (member.status === "busy" || member.status === "shutdown_requested") {
@@ -304,6 +347,85 @@ export async function markStaleMembersAsError(
     await fs.rename(tmpPath, configPath);
     // Session IDs did not change — index does not need updating
     return recovered;
+  });
+}
+
+function eventsFilePath(teamName: string): string {
+  return path.join(teamDir(teamName), "events.jsonl");
+}
+
+export async function appendEvent(
+  teamName: string,
+  event: Omit<ChannelEvent, "id" | "timestamp">,
+): Promise<ChannelEvent> {
+  const fullEvent: ChannelEvent = {
+    ...event,
+    id: `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    timestamp: new Date().toISOString(),
+  };
+  const line = `${JSON.stringify(fullEvent)}\n`;
+
+  const eventsPath = eventsFilePath(teamName);
+
+  await withLock(teamName, async () => {
+    const dir = teamDir(teamName);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.appendFile(eventsPath, line, "utf-8");
+  });
+
+  return fullEvent;
+}
+
+export async function getEvents(
+  teamName: string,
+  limit: number = 50,
+): Promise<{ events: ChannelEvent[]; offset: number }> {
+  const eventsPath = eventsFilePath(teamName);
+  try {
+    const content = await fs.readFile(eventsPath, "utf-8");
+    const lines = content.split("\n").filter((l) => l.trim() !== "");
+    const total = lines.length;
+    const start = Math.max(0, total - limit);
+    const selected = lines.slice(start);
+    const events = selected.map((l) => JSON.parse(l) as ChannelEvent);
+    return { events, offset: total };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return { events: [], offset: 0 };
+    }
+    throw err;
+  }
+}
+
+export async function pruneEvents(
+  teamName: string,
+  keep: number = MAX_EVENTS_LINES,
+): Promise<{ pruned: number; remaining: number }> {
+  return withLock(teamName, async () => {
+    const eventsPath = eventsFilePath(teamName);
+    let content: string;
+    try {
+      content = await fs.readFile(eventsPath, "utf-8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        return { pruned: 0, remaining: 0 };
+      }
+      throw err;
+    }
+
+    const lines = content.split("\n").filter((l) => l.trim() !== "");
+    if (lines.length <= keep) {
+      return { pruned: 0, remaining: lines.length };
+    }
+
+    const toKeep = lines.slice(-keep);
+    const pruned = lines.length - keep;
+
+    const tmpPath = `${eventsPath}.tmp`;
+    await fs.writeFile(tmpPath, `${toKeep.join("\n")}\n`, "utf-8");
+    await fs.rename(tmpPath, eventsPath);
+
+    return { pruned, remaining: toKeep.length };
   });
 }
 

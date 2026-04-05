@@ -2,6 +2,7 @@ import type { PluginInput } from "@opencode-ai/plugin";
 import type { Event } from "@opencode-ai/sdk";
 import { ansi, renderTeamStatus } from "./renderer.js";
 import {
+  appendEvent,
   findTeamBySession,
   listTeams,
   markStaleMembersAsError,
@@ -94,23 +95,23 @@ export function createEventHandler(
       return;
     }
 
-    // If they were busy, notify the lead (with cooldown)
+    // If they were busy, post status to system channel (with cooldown)
     if (wasBusy) {
-      const cooldownKey = `${team.leadSessionId}_${memberName}`;
+      const cooldownKey = `${team.name}_${memberName}`;
       const lastTime = lastNotified.get(cooldownKey) ?? 0;
       if (Date.now() - lastTime < 30_000) return;
       lastNotified.set(cooldownKey, Date.now());
 
-      const notifyMsg = `[System]: Teammate ${memberName} has completed a work cycle and is now ready. Only send them a new message if you have specific new instructions. If they still have tasks in progress, they will continue without prompting.`;
       try {
-        const parts = [{ type: "text" as const, text: notifyMsg }];
-        await client.session.promptAsync({
-          path: { id: team.leadSessionId },
-          body: { parts },
+        await appendEvent(team.name, {
+          type: "status",
+          sender: memberName,
+          senderId: member.sessionId,
+          content: `${memberName} is now ready`,
         });
       } catch (err) {
         console.error(
-          `[opencode-teams] Failed to notify lead of idle member ${memberName}:`,
+          `[opencode-teams] Failed to post status event for ${memberName}:`,
           err,
         );
       }

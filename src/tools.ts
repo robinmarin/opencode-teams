@@ -1,9 +1,12 @@
 import type { PluginInput, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import {
+  appendEvent,
   claimTask,
   completeTask,
   findTeamBySession,
+  getEvents,
+  pruneEvents,
   readTeam,
   updateMember,
   writeTeam,
@@ -61,7 +64,9 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
         try {
           await client.session.promptAsync({
             path: { id: context.sessionID },
-            body: { parts: [{ type: "text" as const, text: leadBehaviourMsg }] },
+            body: {
+              parts: [{ type: "text" as const, text: leadBehaviourMsg }],
+            },
           });
         } catch (behaviorErr) {
           console.warn(
@@ -102,7 +107,7 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           "Model override (e.g. 'anthropic/claude-haiku-4-5'). Defaults to session model.",
         ),
     },
-    async execute(args, context) {
+    async execute(args, _context) {
       try {
         const team = await readTeam(args.teamName);
         if (team === null) {
@@ -286,7 +291,9 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           try {
             await client.session.promptAsync({
               path: { id: member.sessionId },
-              body: { parts: [{ type: "text" as const, text: prefixedMessage }] },
+              body: {
+                parts: [{ type: "text" as const, text: prefixedMessage }],
+              },
             });
             messaged.push(memberName);
           } catch (err) {
@@ -347,7 +354,7 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           `Members (${Object.keys(team.members).length}):`,
           ...memberLines,
           ``,
-          `Tasks: pending=${tasksByStatus["pending"] ?? 0} in_progress=${tasksByStatus["in_progress"] ?? 0} completed=${tasksByStatus["completed"] ?? 0} blocked=${tasksByStatus["blocked"] ?? 0}`,
+          `Tasks: pending=${tasksByStatus.pending ?? 0} in_progress=${tasksByStatus.in_progress ?? 0} completed=${tasksByStatus.completed ?? 0} blocked=${tasksByStatus.blocked ?? 0}`,
         ];
 
         return lines.join("\n");
@@ -485,7 +492,6 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
     },
     async execute(args, context) {
       try {
-        // Look up the calling member's name via their session ID
         const found = await findTeamBySession(context.sessionID);
         const memberName =
           found !== null && found.memberName !== "__lead__"
@@ -508,7 +514,8 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
   // team_task_done
   // ---------------------------------------------------------------------------
   const team_task_done = tool({
-    description: "Mark a task as completed and report any newly unblocked tasks.",
+    description:
+      "Mark a task as completed and report any newly unblocked tasks.",
     args: {
       teamName: z.string().describe("Name of the team"),
       taskId: z.string().describe("ID of the task to mark as completed"),
@@ -531,6 +538,279 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
     },
   });
 
+  // ---------------------------------------------------------------------------
+  // team_post
+  // ---------------------------------------------------------------------------
+  const VALID_REACTIONS = [
+    "+1",
+    "-1",
+    "eyes",
+    "rocket",
+    "white_check_mark",
+  ] as const;
+  type Reaction = (typeof VALID_REACTIONS)[number];
+
+  function isValidReaction(r: string): r is Reaction {
+    return (VALID_REACTIONS as readonly string[]).includes(r);
+  }
+
+  const team_post = tool({
+    description:
+      "Post a message to the team's general channel. Supports @mentions to notify specific members.",
+    args: {
+      teamName: z.string().describe("Name of the team"),
+      message: z.string().describe("Message to post to the channel"),
+      mentions: z
+        .array(z.string())
+        .optional()
+        .describe("Member names to @mention in this message"),
+    },
+    async execute(args, context) {
+      try {
+        const team = await readTeam(args.teamName);
+        if (team === null) {
+          return `Error: Team "${args.teamName}" not found.`;
+        }
+
+        const senderInfo = await findTeamBySession(context.sessionID);
+        const senderName =
+          senderInfo !== null ? senderInfo.memberName : "unknown";
+        const senderId = context.sessionID;
+
+        const validatedMentions: string[] = [];
+        if (args.mentions) {
+          for (const m of args.mentions) {
+            if (team.members[m] !== undefined) {
+              validatedMentions.push(m);
+            }
+          }
+        }
+
+        const event = await appendEvent(args.teamName, {
+          type: "message",
+          sender: senderName,
+          senderId,
+          content: args.message,
+          ...(validatedMentions.length > 0
+            ? { mentions: validatedMentions }
+            : {}),
+        });
+
+        for (const mentioned of validatedMentions) {
+          const member = team.members[mentioned];
+          if (
+            member &&
+            member.status !== "shutdown" &&
+            member.status !== "shutdown_requested"
+          ) {
+            try {
+              await client.session.promptAsync({
+                path: { id: member.sessionId },
+                body: {
+                  parts: [
+                    {
+                      type: "text" as const,
+                      text: `[@mention from ${senderName}]: ${args.message}`,
+                    },
+                  ],
+                },
+              });
+            } catch (err) {
+              console.error(
+                `[team_post] failed to notify mentioned member ${mentioned}:`,
+                err,
+              );
+            }
+          }
+        }
+
+        return `Posted to channel: ${event.id}`;
+      } catch (err) {
+        console.error("[team_post] error:", err);
+        return `Error posting message: ${String(err)}`;
+      }
+    },
+  });
+
+  // ---------------------------------------------------------------------------
+  // team_history
+  // ---------------------------------------------------------------------------
+  const team_history = tool({
+    description: "Read recent messages from the team's channel history.",
+    args: {
+      teamName: z.string().describe("Name of the team"),
+      limit: z
+        .number()
+        .optional()
+        .default(50)
+        .describe("Number of recent messages to retrieve (default: 50)"),
+    },
+    async execute(args, _context) {
+      try {
+        const team = await readTeam(args.teamName);
+        if (team === null) {
+          return `Error: Team "${args.teamName}" not found.`;
+        }
+
+        const { events } = await getEvents(args.teamName, args.limit);
+        if (events.length === 0) {
+          return "No channel messages yet.";
+        }
+
+        const lines = events.map(
+          (e) => `[${e.timestamp}] ${e.sender}: ${e.content}`,
+        );
+        return ["Channel history:", ...lines].join("\n");
+      } catch (err) {
+        console.error("[team_history] error:", err);
+        return `Error fetching history: ${String(err)}`;
+      }
+    },
+  });
+
+  // ---------------------------------------------------------------------------
+  // team_announce
+  // ---------------------------------------------------------------------------
+  const team_announce = tool({
+    description:
+      "Broadcast a message to all active team members INCLUDING the sender. Useful for status updates.",
+    args: {
+      teamName: z.string().describe("Name of the team"),
+      message: z.string().describe("Message to announce to all members"),
+    },
+    async execute(args, context) {
+      try {
+        const team = await readTeam(args.teamName);
+        if (team === null) {
+          return `Error: Team "${args.teamName}" not found.`;
+        }
+
+        const senderInfo = await findTeamBySession(context.sessionID);
+        const senderName =
+          senderInfo !== null ? senderInfo.memberName : context.sessionID;
+        const senderId = context.sessionID;
+
+        await appendEvent(args.teamName, {
+          type: "message",
+          sender: senderName,
+          senderId,
+          content: `[ANNOUNCEMENT] ${args.message}`,
+        });
+
+        const messaged: string[] = [];
+        for (const [memberName, member] of Object.entries(team.members)) {
+          if (member.status !== "ready" && member.status !== "busy") {
+            continue;
+          }
+          try {
+            await client.session.promptAsync({
+              path: { id: member.sessionId },
+              body: {
+                parts: [
+                  {
+                    type: "text" as const,
+                    text: `[Announcement from ${senderName}]: ${args.message}`,
+                  },
+                ],
+              },
+            });
+            messaged.push(memberName);
+          } catch (err) {
+            console.error(
+              `[team_announce] failed to message ${memberName}:`,
+              err,
+            );
+          }
+        }
+
+        return `Announcement sent to: ${messaged.join(", ")} (including sender).`;
+      } catch (err) {
+        console.error("[team_announce] error:", err);
+        return `Error sending announcement: ${String(err)}`;
+      }
+    },
+  });
+
+  // ---------------------------------------------------------------------------
+  // team_react
+  // ---------------------------------------------------------------------------
+  const team_react = tool({
+    description: "Add a reaction to a channel message by its event ID.",
+    args: {
+      teamName: z.string().describe("Name of the team"),
+      messageId: z.string().describe("ID of the message to react to"),
+      reaction: z
+        .string()
+        .describe(
+          `Reaction emoji (shortcode). Valid: ${VALID_REACTIONS.join(", ")}`,
+        ),
+    },
+    async execute(args, context) {
+      try {
+        if (!isValidReaction(args.reaction)) {
+          return `Error: Invalid reaction "${args.reaction}". Valid: ${VALID_REACTIONS.join(", ")}`;
+        }
+
+        const team = await readTeam(args.teamName);
+        if (team === null) {
+          return `Error: Team "${args.teamName}" not found.`;
+        }
+
+        const senderInfo = await findTeamBySession(context.sessionID);
+        const senderName =
+          senderInfo !== null ? senderInfo.memberName : context.sessionID;
+        const senderId = context.sessionID;
+
+        const event = await appendEvent(args.teamName, {
+          type: "reaction",
+          sender: senderName,
+          senderId,
+          content: `reacted with ${args.reaction}`,
+          targetId: args.messageId,
+          reaction: args.reaction,
+        });
+
+        return `Reaction ${args.reaction} added to ${args.messageId}: ${event.id}`;
+      } catch (err) {
+        console.error("[team_react] error:", err);
+        return `Error adding reaction: ${String(err)}`;
+      }
+    },
+  });
+
+  // ---------------------------------------------------------------------------
+  // team_prune
+  // ---------------------------------------------------------------------------
+  const team_prune = tool({
+    description:
+      "Compact the events log, keeping only the most recent N entries. Use to prevent unbounded file growth.",
+    args: {
+      teamName: z.string().describe("Name of the team"),
+      keep: z
+        .number()
+        .optional()
+        .default(1000)
+        .describe("Number of recent events to keep (default: 1000)"),
+    },
+    async execute(args, _context) {
+      try {
+        const team = await readTeam(args.teamName);
+        if (team === null) {
+          return `Error: Team "${args.teamName}" not found.`;
+        }
+
+        const { pruned, remaining } = await pruneEvents(
+          args.teamName,
+          args.keep,
+        );
+        return `Pruned ${pruned} events. ${remaining} events remaining.`;
+      } catch (err) {
+        console.error("[team_prune] error:", err);
+        return `Error pruning events: ${String(err)}`;
+      }
+    },
+  });
+
   return {
     team_create,
     team_spawn,
@@ -541,6 +821,11 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
     team_task_add,
     team_task_claim,
     team_task_done,
+    team_post,
+    team_history,
+    team_announce,
+    team_react,
+    team_prune,
   };
 }
 

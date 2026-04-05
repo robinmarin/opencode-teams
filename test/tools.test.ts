@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ToolDefinition } from "@opencode-ai/plugin";
-import { readTeam, setTestTeamsDir, writeTeam } from "../src/state.js";
+import { appendEvent, getEvents, readTeam, setTestTeamsDir, writeTeam } from "../src/state.js";
 import type { TeamConfig } from "../src/state.js";
 import { createTools } from "../src/tools.js";
 
@@ -508,5 +508,247 @@ describe("team_task_done", () => {
     expect(result).toContain("completed");
     // No "Newly unblocked" section
     expect(result).not.toContain("Newly unblocked");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Seed helpers for channel tests
+// ---------------------------------------------------------------------------
+function seedTeamWithMembers(overrides?: Partial<TeamConfig>): Promise<void> {
+  return writeTeam({
+    name: "alpha",
+    leadSessionId: "lead-session",
+    members: {
+      alice: {
+        name: "alice",
+        sessionId: "alice-sess",
+        status: "ready",
+        agentType: "default",
+        model: "claude-3",
+        spawnedAt: new Date().toISOString(),
+      },
+      bob: {
+        name: "bob",
+        sessionId: "bob-sess",
+        status: "busy",
+        agentType: "default",
+        model: "claude-3",
+        spawnedAt: new Date().toISOString(),
+      },
+    },
+    tasks: {},
+    createdAt: new Date().toISOString(),
+    ...overrides,
+  });
+}
+
+describe("team_post", () => {
+  it("returns error when team not found", async () => {
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_post", {
+      teamName: "ghost",
+      message: "Hello",
+    });
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("posts message to channel without mentions", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(
+      tools,
+      "team_post",
+      { teamName: "alpha", message: "Hello team!" },
+      "alice-sess",
+    );
+    expect(result).not.toContain("Error");
+    expect(result).toContain("Posted to channel:");
+    // Verify event was stored
+    const { events } = await getEvents("alpha", 10);
+    expect(events.length).toBe(1);
+    expect(events[0].content).toBe("Hello team!");
+    expect(events[0].sender).toBe("alice");
+  });
+
+  it("posts message with mentions and notifies mentioned members", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(
+      tools,
+      "team_post",
+      { teamName: "alpha", message: "Hey @bob", mentions: ["bob"] },
+      "alice-sess",
+    );
+    expect(result).not.toContain("Error");
+    expect(result).toContain("Posted to channel:");
+    // Verify event has mentions
+    const { events } = await getEvents("alpha", 10);
+    expect(events[0].mentions).toEqual(["bob"]);
+  });
+
+  it("ignores invalid mention targets", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(
+      tools,
+      "team_post",
+      { teamName: "alpha", message: "Hey @ghost", mentions: ["ghost"] },
+      "alice-sess",
+    );
+    expect(result).not.toContain("Error");
+    // Should still post but without the invalid mention
+    const { events } = await getEvents("alpha", 10);
+    expect(events[0].mentions).toBeUndefined();
+  });
+});
+
+describe("team_history", () => {
+  it("returns error when team not found", async () => {
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_history", { teamName: "ghost" });
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("returns 'No channel messages yet.' for empty channel", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_history", { teamName: "alpha" });
+    expect(result).toContain("No channel messages yet.");
+  });
+
+  it("returns formatted history with messages", async () => {
+    await seedTeamWithMembers();
+    await appendEvent("alpha", {
+      type: "message",
+      sender: "alice",
+      senderId: "alice-sess",
+      content: "First message",
+    });
+    await appendEvent("alpha", {
+      type: "message",
+      sender: "bob",
+      senderId: "bob-sess",
+      content: "Second message",
+    });
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_history", { teamName: "alpha" });
+    expect(result).toContain("Channel history:");
+    expect(result).toContain("alice");
+    expect(result).toContain("First message");
+    expect(result).toContain("bob");
+    expect(result).toContain("Second message");
+  });
+
+  it("respects limit parameter", async () => {
+    await seedTeamWithMembers();
+    for (let i = 0; i < 5; i++) {
+      await appendEvent("alpha", {
+        type: "message",
+        sender: "alice",
+        senderId: "alice-sess",
+        content: `Message ${i}`,
+      });
+    }
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_history", {
+      teamName: "alpha",
+      limit: 2,
+    });
+    // Should only show last 2
+    expect(result).toContain("Message 3");
+    expect(result).toContain("Message 4");
+    expect(result).not.toContain("Message 0");
+  });
+});
+
+describe("team_announce", () => {
+  it("returns error when team not found", async () => {
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_announce", {
+      teamName: "ghost",
+      message: "Hello",
+    });
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("appends announcement to channel", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(
+      tools,
+      "team_announce",
+      { teamName: "alpha", message: "All hands meeting at 3pm" },
+      "alice-sess",
+    );
+    expect(result).not.toContain("Error");
+    expect(result).toContain("Announcement sent to");
+    // Verify event was stored
+    const { events } = await getEvents("alpha", 10);
+    const announcementEvent = events.find(
+      (e) => e.content.includes("All hands meeting"),
+    );
+    expect(announcementEvent).toBeDefined();
+    expect(announcementEvent?.type).toBe("message");
+  });
+});
+
+describe("team_react", () => {
+  it("returns error when team not found", async () => {
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_react", {
+      teamName: "ghost",
+      messageId: "evt_123",
+      reaction: "+1",
+    });
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("returns error for invalid reaction", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_react", {
+      teamName: "alpha",
+      messageId: "evt_123",
+      reaction: "invalid",
+    });
+    expect(result).toContain("Error");
+    expect(result).toContain("Invalid reaction");
+  });
+
+  it("appends valid reaction event", async () => {
+    await seedTeamWithMembers();
+    // First post a message to react to
+    const { events } = await getEvents("alpha", 10);
+    const msgId = events.length > 0 ? events[0].id : "evt_seed";
+    if (events.length === 0) {
+      await appendEvent("alpha", {
+        type: "message",
+        sender: "alice",
+        senderId: "alice-sess",
+        content: "Test message",
+      });
+    }
+    const { events: eventsAfterPost } = await getEvents("alpha", 10);
+    const targetId = eventsAfterPost[0].id;
+
+    const tools = createTools(makeStubClient());
+    const result = await callTool(
+      tools,
+      "team_react",
+      { teamName: "alpha", messageId: targetId, reaction: "+1" },
+      "bob-sess",
+    );
+    expect(result).not.toContain("Error");
+    expect(result).toContain("+1");
+    // Verify reaction was stored
+    const { events: finalEvents } = await getEvents("alpha", 10);
+    const reactionEvent = finalEvents.find((e) => e.type === "reaction");
+    expect(reactionEvent).toBeDefined();
+    expect(reactionEvent?.reaction).toBe("+1");
+    expect(reactionEvent?.targetId).toBe(targetId);
   });
 });
