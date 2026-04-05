@@ -43,6 +43,33 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           tasks: {},
           createdAt: new Date().toISOString(),
         });
+
+        // SDK audit: @opencode-ai/sdk exposes no silent system-prompt injection
+        // (no appendSystem / updateSystem / systemPrompt field on session). The
+        // behavioural framing is therefore sent as a visible promptAsync message
+        // to the lead's own session. This is acceptable — it frames the lead's
+        // role at team creation time and appears once in their chat history.
+        const leadBehaviourMsg = [
+          `[Team Protocol]: You are the lead of an agent team. Your role is to delegate work and synthesise results — not to micromanage. Follow these rules strictly:`,
+          ``,
+          `When you spawn a teammate, trust them to complete their task. Do not message them again unless you have new specific instructions that change their task.`,
+          `When you receive an idle notification for a teammate, acknowledge it internally and wait. Do not call team_message or team_broadcast in response to an idle notification unless the task genuinely requires new input.`,
+          `Never send check-in messages like "how is it going?" or "any updates?". Teammates will notify you when they are done.`,
+          `Your job is to wait for results, synthesise them, and decide on next steps — not to fill silence with coordination overhead.`,
+          `If all teammates are busy, do nothing. Wait.`,
+        ].join("\n");
+        try {
+          await client.session.promptAsync({
+            path: { id: context.sessionID },
+            body: { parts: [{ type: "text" as const, text: leadBehaviourMsg }] },
+          });
+        } catch (behaviorErr) {
+          console.warn(
+            "[team_create] failed to send lead behavioural prompt (non-fatal):",
+            behaviorErr,
+          );
+        }
+
         return `Team "${args.name}" created. You are the lead (session: ${context.sessionID}).`;
       } catch (err) {
         console.error("[team_create] error:", err);
