@@ -1,4 +1,4 @@
-# opencode-teams
+# @robinmarin/opencode-teams
 
 An [OpenCode](https://opencode.ai) plugin that adds agent teams — spawn, coordinate, and shut down sub-agent sessions directly from your lead session.
 
@@ -22,7 +22,19 @@ An [OpenCode](https://opencode.ai) plugin that adds agent teams — spawn, coord
 - When a member goes idle after being busy, the plugin automatically notifies the lead
 - Spawned sub-agents receive a system prompt instructing them not to use team tools
 
-## Local Testing
+## Installation
+
+Add to `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "plugin": ["npm:@robinmarin/opencode-teams"]
+}
+```
+
+Restart OpenCode. The nine team tools will be available in your session.
+
+## Local Development
 
 ```bash
 # 1. Install dependencies
@@ -31,18 +43,12 @@ bun install
 # 2. Build
 bun run build
 
-# 3. Symlink the built plugin
-mkdir -p ~/.config/opencode/plugins
-ln -sf $(pwd)/dist/index.js ~/.config/opencode/plugins/opencode-teams.js
-
-# 4. Register the plugin in your OpenCode config
+# 3. Point OpenCode at the local build
 # Add to ~/.config/opencode/opencode.json:
 # {
-#   "plugin": ["file://~/.config/opencode/plugins/opencode-teams.js"]
+#   "plugin": ["file:///absolute/path/to/opencode-teams/dist/index.js"]
 # }
 ```
-
-After restarting OpenCode, the six team tools will be available in your session.
 
 ## Development
 

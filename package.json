@@ -1,11 +1,24 @@
 {
-  "name": "opencode-teams",
+  "name": "@robinmarin/opencode-teams",
   "version": "0.1.0",
+  "description": "OpenCode plugin — spawn and coordinate sub-agent teams from your lead session",
   "type": "module",
   "main": "./dist/index.js",
   "exports": {
     ".": "./dist/index.js"
   },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "ai",
+    "agents",
+    "multi-agent",
+    "teams"
+  ],
+  "license": "MIT",
   "scripts": {
     "build": "tsc",
     "test": "bun test",
