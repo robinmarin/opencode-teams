@@ -1,8 +1,32 @@
 import type { PluginInput } from "@opencode-ai/plugin";
 import type { Event } from "@opencode-ai/sdk";
-import { findTeamBySession } from "./state.js";
+import { findTeamBySession, listTeams, markStaleMembersAsError, updateMember } from "./state.js";
 
 type Client = PluginInput["client"];
+
+/**
+ * On startup, scan all teams for members whose status is "busy" or
+ * "shutdown_requested" — these represent sessions that were live when the
+ * process last died. Mark them as "error" so the lead can decide what to do.
+ */
+async function recoverStaleMembers(): Promise<void> {
+  const teamNames = await listTeams();
+  for (const teamName of teamNames) {
+    try {
+      const recovered = await markStaleMembersAsError(teamName);
+      for (const { memberName, previousStatus } of recovered) {
+        console.log(
+          `[opencode-teams] Recovery: member ${memberName} in team ${teamName} was stale (${previousStatus}), marked as error`,
+        );
+      }
+    } catch (err) {
+      console.error(
+        `[opencode-teams] Recovery: failed to recover team ${teamName}:`,
+        err,
+      );
+    }
+  }
+}
 
 /**
  * Creates an event handler to be registered as the `event` hook in the plugin's
@@ -17,6 +41,11 @@ type Client = PluginInput["client"];
 export function createEventHandler(
   client: Client,
 ): (input: { event: Event }) => Promise<void> {
+  // Fire-and-forget startup recovery — do not block plugin init
+  recoverStaleMembers().catch((err) => {
+    console.error("[opencode-teams] recoverStaleMembers failed:", err);
+  });
+
   return async ({ event }) => {
     if (event.type !== "session.idle") return;
 
@@ -57,7 +86,6 @@ export function createEventHandler(
 
     // Update member status to ready
     try {
-      const { updateMember } = await import("./state.js");
       await updateMember(team.name, memberName, { status: "ready" });
     } catch (err) {
       console.error(

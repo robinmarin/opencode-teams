@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ToolDefinition } from "@opencode-ai/plugin";
-import { setTestTeamsDir, writeTeam } from "../src/state.js";
+import { readTeam, setTestTeamsDir, writeTeam } from "../src/state.js";
 import type { TeamConfig } from "../src/state.js";
 import { createTools } from "../src/tools.js";
 
@@ -53,6 +53,47 @@ function makeStubClient(sessionId = "stub-session-new") {
           request: new Request("http://localhost"),
           response: new Response(),
         }) satisfies VoidResult,
+    },
+  } as unknown as Parameters<typeof createTools>[0];
+}
+
+/**
+ * A stub client that captures the order of events: when state was written
+ * relative to when promptAsync fired.
+ */
+function makeOrderCapturingClient(
+  sessionId: string,
+  events: string[],
+  teamName: string,
+  memberName: string,
+) {
+  return {
+    session: {
+      create: async () => {
+        events.push("session.create");
+        return {
+          data: { id: sessionId },
+          error: undefined,
+          request: new Request("http://localhost"),
+          response: new Response(),
+        } satisfies SessionCreateResult;
+      },
+      promptAsync: async () => {
+        // At the moment promptAsync fires, check if state already exists
+        const team = await readTeam(teamName);
+        if (team?.members[memberName] !== undefined) {
+          events.push("state.written.before.prompt");
+        } else {
+          events.push("state.NOT.written.before.prompt");
+        }
+        events.push("promptAsync");
+        return {
+          data: undefined,
+          error: undefined,
+          request: new Request("http://localhost"),
+          response: new Response(),
+        } satisfies VoidResult;
+      },
     },
   } as unknown as Parameters<typeof createTools>[0];
 }
@@ -240,5 +281,232 @@ describe("team_status", () => {
     expect(result).toContain("alice");
     expect(result).toContain("busy");
     expect(result).toContain("pending=0");
+  });
+});
+
+describe("team_spawn state-before-prompt ordering", () => {
+  it("writes member state before firing promptAsync", async () => {
+    await seedTeam();
+    const events: string[] = [];
+    const client = makeOrderCapturingClient(
+      "ordered-sess-001",
+      events,
+      "alpha",
+      "alice",
+    );
+    const tools = createTools(client);
+    const result = await callTool(tools, "team_spawn", {
+      teamName: "alpha",
+      memberName: "alice",
+      role: "engineer",
+      initialPrompt: "Do stuff",
+    });
+    expect(result).not.toContain("Error");
+    // The state must be written before promptAsync is called
+    const stateWrittenIdx = events.indexOf("state.written.before.prompt");
+    const promptIdx = events.indexOf("promptAsync");
+    expect(stateWrittenIdx).toBeGreaterThanOrEqual(0);
+    expect(promptIdx).toBeGreaterThanOrEqual(0);
+    expect(stateWrittenIdx).toBeLessThan(promptIdx);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Seed helpers for task tests
+// ---------------------------------------------------------------------------
+function seedTeamWithTasks(overrides?: Partial<TeamConfig>): Promise<void> {
+  return writeTeam({
+    name: "alpha",
+    leadSessionId: "lead-session",
+    members: {
+      alice: {
+        name: "alice",
+        sessionId: "alice-sess",
+        status: "ready",
+        agentType: "default",
+        model: "claude-3",
+        spawnedAt: new Date().toISOString(),
+      },
+    },
+    tasks: {},
+    createdAt: new Date().toISOString(),
+    ...overrides,
+  });
+}
+
+describe("team_task_add", () => {
+  it("adds a task and returns the task ID", async () => {
+    await seedTeamWithTasks();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_task_add", {
+      teamName: "alpha",
+      title: "Build API",
+      description: "Implement the REST endpoints",
+    });
+    expect(result).not.toContain("Error");
+    expect(result).toContain("task_");
+    // Verify it was persisted
+    const team = await readTeam("alpha");
+    expect(Object.keys(team?.tasks ?? {}).length).toBe(1);
+  });
+
+  it("returns error when team does not exist", async () => {
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_task_add", {
+      teamName: "ghost",
+      title: "x",
+      description: "y",
+    });
+    expect(result).toContain("Error");
+  });
+});
+
+describe("team_task_claim", () => {
+  it("returns error when task does not exist", async () => {
+    await seedTeamWithTasks();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(
+      tools,
+      "team_task_claim",
+      { teamName: "alpha", taskId: "task_nonexistent" },
+      "alice-sess",
+    );
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("returns error when dependencies are not completed", async () => {
+    const blockerId = "task_111";
+    await seedTeamWithTasks({
+      tasks: {
+        [blockerId]: {
+          id: blockerId,
+          title: "Blocker",
+          description: "Must run first",
+          status: "pending",
+          assignee: null,
+          dependsOn: [],
+          createdAt: new Date().toISOString(),
+        },
+        task_222: {
+          id: "task_222",
+          title: "Dependent",
+          description: "Depends on blocker",
+          status: "pending",
+          assignee: null,
+          dependsOn: [blockerId],
+          createdAt: new Date().toISOString(),
+        },
+      },
+    });
+    const tools = createTools(makeStubClient());
+    const result = await callTool(
+      tools,
+      "team_task_claim",
+      { teamName: "alpha", taskId: "task_222" },
+      "alice-sess",
+    );
+    expect(result).toContain("Error");
+    expect(result).toContain(blockerId);
+  });
+
+  it("succeeds when all dependencies are completed", async () => {
+    const doneId = "task_done";
+    await seedTeamWithTasks({
+      tasks: {
+        [doneId]: {
+          id: doneId,
+          title: "Done task",
+          description: "Already complete",
+          status: "completed",
+          assignee: "alice",
+          dependsOn: [],
+          createdAt: new Date().toISOString(),
+        },
+        task_next: {
+          id: "task_next",
+          title: "Next task",
+          description: "Depends on done",
+          status: "pending",
+          assignee: null,
+          dependsOn: [doneId],
+          createdAt: new Date().toISOString(),
+        },
+      },
+    });
+    const tools = createTools(makeStubClient());
+    const result = await callTool(
+      tools,
+      "team_task_claim",
+      { teamName: "alpha", taskId: "task_next" },
+      "alice-sess",
+    );
+    expect(result).not.toContain("Error");
+    expect(result).toContain("in_progress");
+    const team = await readTeam("alpha");
+    expect(team?.tasks["task_next"]?.status).toBe("in_progress");
+  });
+});
+
+describe("team_task_done", () => {
+  it("marks task completed and reports unblocked tasks", async () => {
+    const prereqId = "task_prereq";
+    await seedTeamWithTasks({
+      tasks: {
+        [prereqId]: {
+          id: prereqId,
+          title: "Prereq",
+          description: "Must be done first",
+          status: "in_progress",
+          assignee: "alice",
+          dependsOn: [],
+          createdAt: new Date().toISOString(),
+        },
+        task_waiting: {
+          id: "task_waiting",
+          title: "Waiting task",
+          description: "Blocked by prereq",
+          status: "pending",
+          assignee: null,
+          dependsOn: [prereqId],
+          createdAt: new Date().toISOString(),
+        },
+      },
+    });
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_task_done", {
+      teamName: "alpha",
+      taskId: prereqId,
+    });
+    expect(result).not.toContain("Error");
+    expect(result).toContain("completed");
+    expect(result).toContain("task_waiting");
+    const team = await readTeam("alpha");
+    expect(team?.tasks[prereqId]?.status).toBe("completed");
+  });
+
+  it("marks task completed with no unblocked tasks when none depend on it", async () => {
+    await seedTeamWithTasks({
+      tasks: {
+        task_solo: {
+          id: "task_solo",
+          title: "Solo task",
+          description: "No dependants",
+          status: "in_progress",
+          assignee: "alice",
+          dependsOn: [],
+          createdAt: new Date().toISOString(),
+        },
+      },
+    });
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_task_done", {
+      teamName: "alpha",
+      taskId: "task_solo",
+    });
+    expect(result).not.toContain("Error");
+    expect(result).toContain("completed");
+    // No "Newly unblocked" section
+    expect(result).not.toContain("Newly unblocked");
   });
 });

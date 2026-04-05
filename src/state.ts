@@ -50,6 +50,8 @@ let _overrideTeamsDir: string | undefined;
 /** For use in tests only. Pass the temp directory to isolate state. */
 export function setTestTeamsDir(dir: string | undefined): void {
   _overrideTeamsDir = dir;
+  // Clear the reverse index so tests start clean
+  sessionIndex.clear();
 }
 
 function teamsDir(): string {
@@ -82,6 +84,29 @@ function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
 }
 
 // ---------------------------------------------------------------------------
+// In-memory reverse index: sessionId → { teamName, memberName }
+//
+// Kept in sync on every write. Unknown sessions fall back to a full disk scan
+// that populates the index as a side effect, making subsequent lookups O(1).
+// ---------------------------------------------------------------------------
+
+const sessionIndex = new Map<string, { teamName: string; memberName: string }>();
+
+function indexTeam(config: TeamConfig): void {
+  // Remove any stale entries for this team before re-indexing
+  for (const [sessionId, entry] of sessionIndex) {
+    if (entry.teamName === config.name) sessionIndex.delete(sessionId);
+  }
+  sessionIndex.set(config.leadSessionId, {
+    teamName: config.name,
+    memberName: "__lead__",
+  });
+  for (const [memberName, member] of Object.entries(config.members)) {
+    sessionIndex.set(member.sessionId, { teamName: config.name, memberName });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -104,6 +129,7 @@ export async function writeTeam(config: TeamConfig): Promise<void> {
     const tmpPath = `${configPath}.tmp`;
     await fs.writeFile(tmpPath, JSON.stringify(config, null, 2), "utf-8");
     await fs.rename(tmpPath, configPath);
+    indexTeam(config);
   });
 }
 
@@ -124,12 +150,26 @@ export async function updateMember(
     const tmpPath = `${configPath}.tmp`;
     await fs.writeFile(tmpPath, JSON.stringify(config, null, 2), "utf-8");
     await fs.rename(tmpPath, configPath);
+    indexTeam(config);
   });
 }
 
 export async function findTeamBySession(
   sessionId: string,
 ): Promise<{ team: TeamConfig; memberName: string } | null> {
+  // Fast path: index hit
+  const entry = sessionIndex.get(sessionId);
+  if (entry !== undefined) {
+    const team = await readTeam(entry.teamName);
+    if (team === null) {
+      sessionIndex.delete(sessionId);
+      return null;
+    }
+    return { team, memberName: entry.memberName };
+  }
+
+  // Slow path: full disk scan; populate index as a side effect so future
+  // lookups for any session in these teams are O(1).
   let names: string[];
   try {
     names = await listTeams();
@@ -140,22 +180,131 @@ export async function findTeamBySession(
   for (const name of names) {
     const team = await readTeam(name);
     if (team === null) continue;
+    indexTeam(team);
 
-    // Check if this session is the lead
-    if (team.leadSessionId === sessionId) {
-      // Return with a special sentinel member name for the lead
-      return { team, memberName: "__lead__" };
-    }
-
-    // Check all members
+    if (team.leadSessionId === sessionId) return { team, memberName: "__lead__" };
     for (const [memberName, member] of Object.entries(team.members)) {
-      if (member.sessionId === sessionId) {
-        return { team, memberName };
-      }
+      if (member.sessionId === sessionId) return { team, memberName };
     }
   }
 
   return null;
+}
+
+export async function claimTask(
+  teamName: string,
+  taskId: string,
+  memberName: string,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  return withLock(teamName, async () => {
+    const configPath = teamConfigPath(teamName);
+    const raw = await fs.readFile(configPath, "utf-8");
+    const config = JSON.parse(raw) as TeamConfig;
+
+    const task = config.tasks[taskId];
+    if (task === undefined) {
+      return { ok: false, reason: `Task "${taskId}" not found in team "${teamName}".` };
+    }
+    if (task.status !== "pending") {
+      return { ok: false, reason: `Task "${taskId}" is not pending (current status: "${task.status}").` };
+    }
+
+    const blocking: string[] = [];
+    for (const depId of task.dependsOn) {
+      const dep = config.tasks[depId];
+      if (dep === undefined || dep.status !== "completed") {
+        blocking.push(depId);
+      }
+    }
+    if (blocking.length > 0) {
+      return {
+        ok: false,
+        reason: `Task "${taskId}" is blocked by: ${blocking.join(", ")}. Complete those tasks first.`,
+      };
+    }
+
+    config.tasks[taskId] = { ...task, status: "in_progress", assignee: memberName };
+    const tmpPath = `${configPath}.tmp`;
+    await fs.writeFile(tmpPath, JSON.stringify(config, null, 2), "utf-8");
+    await fs.rename(tmpPath, configPath);
+    return { ok: true };
+  });
+}
+
+/**
+ * Atomically marks a task as completed and computes which tasks are now
+ * unblocked — all in a single lock pass to avoid TOCTOU races.
+ */
+export async function completeTask(
+  teamName: string,
+  taskId: string,
+): Promise<{ ok: true; unblockedTaskIds: string[] } | { ok: false; reason: string }> {
+  return withLock(teamName, async () => {
+    const configPath = teamConfigPath(teamName);
+    const raw = await fs.readFile(configPath, "utf-8");
+    const config = JSON.parse(raw) as TeamConfig;
+
+    const task = config.tasks[taskId];
+    if (task === undefined) {
+      return { ok: false, reason: `Task "${taskId}" not found in team "${teamName}".` };
+    }
+
+    config.tasks[taskId] = { ...task, status: "completed" };
+
+    const unblockedTaskIds: string[] = [];
+    for (const [id, t] of Object.entries(config.tasks)) {
+      if (t.status !== "pending") continue;
+      if (!t.dependsOn.includes(taskId)) continue;
+      const allDone = t.dependsOn.every(
+        (depId) => config.tasks[depId]?.status === "completed",
+      );
+      if (allDone) unblockedTaskIds.push(id);
+    }
+
+    const tmpPath = `${configPath}.tmp`;
+    await fs.writeFile(tmpPath, JSON.stringify(config, null, 2), "utf-8");
+    await fs.rename(tmpPath, configPath);
+    return { ok: true, unblockedTaskIds };
+  });
+}
+
+/**
+ * In a single lock pass, marks all busy/shutdown_requested members in a team
+ * as error. Returns the list of recovered members with their previous status,
+ * so callers can log without re-reading the file.
+ */
+export async function markStaleMembersAsError(
+  teamName: string,
+): Promise<Array<{ memberName: string; previousStatus: MemberStatus }>> {
+  return withLock(teamName, async () => {
+    const configPath = teamConfigPath(teamName);
+    let raw: string;
+    try {
+      raw = await fs.readFile(configPath, "utf-8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw err;
+    }
+    const config = JSON.parse(raw) as TeamConfig;
+
+    const recovered: Array<{ memberName: string; previousStatus: MemberStatus }> = [];
+    let dirty = false;
+    for (const [name, member] of Object.entries(config.members)) {
+      if (member.status === "busy" || member.status === "shutdown_requested") {
+        recovered.push({ memberName: name, previousStatus: member.status });
+        config.members[name] = { ...member, status: "error" };
+        dirty = true;
+      }
+    }
+
+    if (!dirty) return [];
+
+    const tmpPath = `${configPath}.tmp`;
+    await fs.writeFile(tmpPath, JSON.stringify(config, null, 2), "utf-8");
+    await fs.rename(tmpPath, configPath);
+    // Session IDs did not change — index does not need updating
+    return recovered;
+  });
 }
 
 export async function listTeams(): Promise<string[]> {

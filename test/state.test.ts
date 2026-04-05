@@ -3,8 +3,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  claimTask,
+  completeTask,
   findTeamBySession,
   listTeams,
+  markStaleMembersAsError,
   readTeam,
   setTestTeamsDir,
   updateMember,
@@ -167,6 +170,154 @@ describe("findTeamBySession", () => {
     expect(result).not.toBeNull();
     expect(result?.memberName).toBe("charlie");
     expect(result?.team.name).toBe("test-team");
+  });
+});
+
+describe("claimTask", () => {
+  it("two concurrent claims for the same task result in exactly one success and one failure", async () => {
+    const taskId = "task_contested";
+    const team = makeTeam({
+      tasks: {
+        [taskId]: {
+          id: taskId,
+          title: "Contested task",
+          description: "Two members race to claim this",
+          status: "pending",
+          assignee: null,
+          dependsOn: [],
+          createdAt: new Date().toISOString(),
+        },
+      },
+    });
+    await writeTeam(team);
+
+    // Both claims fire concurrently
+    const [r1, r2] = await Promise.all([
+      claimTask("test-team", taskId, "alice"),
+      claimTask("test-team", taskId, "bob"),
+    ]);
+
+    const successes = [r1, r2].filter((r) => r.ok);
+    const failures = [r1, r2].filter((r) => !r.ok);
+    expect(successes.length).toBe(1);
+    expect(failures.length).toBe(1);
+
+    // The task should be in_progress, assigned to whichever won
+    const result = await readTeam("test-team");
+    expect(result?.tasks[taskId]?.status).toBe("in_progress");
+    const winner = successes[0];
+    expect(winner?.ok).toBe(true);
+  });
+});
+
+describe("completeTask", () => {
+  it("completes a task and returns unblocked task IDs in one pass", async () => {
+    const prereqId = "task_prereq";
+    const team = makeTeam({
+      tasks: {
+        [prereqId]: {
+          id: prereqId,
+          title: "Prereq",
+          description: "First",
+          status: "in_progress",
+          assignee: "alice",
+          dependsOn: [],
+          createdAt: new Date().toISOString(),
+        },
+        task_waiting: {
+          id: "task_waiting",
+          title: "Waiting",
+          description: "Needs prereq",
+          status: "pending",
+          assignee: null,
+          dependsOn: [prereqId],
+          createdAt: new Date().toISOString(),
+        },
+      },
+    });
+    await writeTeam(team);
+
+    const result = await completeTask("test-team", prereqId);
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(result.unblockedTaskIds).toContain("task_waiting");
+
+    const updated = await readTeam("test-team");
+    expect(updated?.tasks[prereqId]?.status).toBe("completed");
+  });
+
+  it("returns error when task not found", async () => {
+    const team = makeTeam();
+    await writeTeam(team);
+    const result = await completeTask("test-team", "task_ghost");
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.reason).toContain("not found");
+  });
+});
+
+describe("markStaleMembersAsError", () => {
+  it("marks busy and shutdown_requested members as error in one lock pass", async () => {
+    const team = makeTeam({
+      members: {
+        busy_one: {
+          name: "busy_one",
+          sessionId: "s1",
+          status: "busy",
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: new Date().toISOString(),
+        },
+        shutdown_one: {
+          name: "shutdown_one",
+          sessionId: "s2",
+          status: "shutdown_requested",
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: new Date().toISOString(),
+        },
+        ready_one: {
+          name: "ready_one",
+          sessionId: "s3",
+          status: "ready",
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: new Date().toISOString(),
+        },
+      },
+    });
+    await writeTeam(team);
+
+    const recovered = await markStaleMembersAsError("test-team");
+    expect(recovered.length).toBe(2);
+    const names = recovered.map((r) => r.memberName).sort();
+    expect(names).toEqual(["busy_one", "shutdown_one"]);
+    const statuses = recovered.map((r) => r.previousStatus).sort();
+    expect(statuses).toContain("busy");
+    expect(statuses).toContain("shutdown_requested");
+
+    const updated = await readTeam("test-team");
+    expect(updated?.members["busy_one"]?.status).toBe("error");
+    expect(updated?.members["shutdown_one"]?.status).toBe("error");
+    expect(updated?.members["ready_one"]?.status).toBe("ready");
+  });
+
+  it("returns empty array when no stale members exist", async () => {
+    const team = makeTeam({
+      members: {
+        alice: {
+          name: "alice",
+          sessionId: "s-alice",
+          status: "ready",
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: new Date().toISOString(),
+        },
+      },
+    });
+    await writeTeam(team);
+    const recovered = await markStaleMembersAsError("test-team");
+    expect(recovered).toEqual([]);
   });
 });
 

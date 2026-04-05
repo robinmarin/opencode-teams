@@ -12,6 +12,9 @@ An [OpenCode](https://opencode.ai) plugin that adds agent teams — spawn, coord
 | `team_broadcast` | Send a message to all active members. |
 | `team_status` | Show member statuses and task counts. |
 | `team_shutdown` | Shut down one or all members. |
+| `team_task_add` | Add a task to the team's task board. |
+| `team_task_claim` | Claim a pending task (respects dependency ordering). |
+| `team_task_done` | Mark a task as completed and report newly unblocked tasks. |
 
 ## How it works
 
@@ -78,3 +81,11 @@ Team configs live at `~/.config/opencode/teams/<name>/config.json`:
 ```
 
 Member statuses: `ready | busy | shutdown_requested | shutdown | error`
+
+## Known Limitations
+
+**Sub-agent tool isolation is instruction-only.** The `@opencode-ai/sdk` `session.create()` body only accepts `{ parentID, title }` — there is no deny list or permissions field. Sub-agents are told not to use team tools via their system prompt, but a model could ignore this instruction. A future SDK version may expose per-session deny rules; at that point the six team tools should be explicitly denied for all spawned sessions.
+
+**Mid-turn idle notification race.** If the lead session is mid-turn (actively generating a response) when a teammate goes idle, the `session.idle` event fires and the plugin sends a `promptAsync` to the lead. OpenCode queues this message; the lead will not re-enter its loop until the current turn completes. There is no mechanism to interrupt an in-progress turn.
+
+**No nested teams.** Sub-agents spawned by a lead cannot themselves create teams or spawn further sub-agents. The team management tools are reserved for the original lead session.

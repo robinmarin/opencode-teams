@@ -1,12 +1,8 @@
 import type { PluginInput, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import type {
-  AgentPartInput,
-  FilePartInput,
-  SubtaskPartInput,
-  TextPartInput,
-} from "@opencode-ai/sdk";
 import {
+  claimTask,
+  completeTask,
   findTeamBySession,
   readTeam,
   updateMember,
@@ -18,34 +14,6 @@ const z = tool.schema;
 
 // Re-export the client type for convenience
 type Client = PluginInput["client"];
-
-type PromptPart =
-  | TextPartInput
-  | FilePartInput
-  | AgentPartInput
-  | SubtaskPartInput;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-async function sendAsync(
-  client: Client,
-  sessionId: string,
-  text: string,
-  system?: string,
-  model?: { providerID: string; modelID: string },
-): Promise<void> {
-  const parts: PromptPart[] = [{ type: "text", text }];
-  await client.session.promptAsync({
-    path: { id: sessionId },
-    body: {
-      parts,
-      ...(system !== undefined ? { system } : {}),
-      ...(model !== undefined ? { model } : {}),
-    },
-  });
-}
 
 // ---------------------------------------------------------------------------
 // tool definitions
@@ -126,7 +94,11 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
         }
         const sessionId = createResult.data.id;
 
-        // Build system prompt for member isolation
+        // Known limitation: @opencode-ai/sdk session.create() only accepts
+        // { parentID, title } in its body — there is no deny list or permissions
+        // field. Sub-agent tool isolation is therefore instruction-only. A
+        // future SDK version may expose a deny list; at that point add explicit
+        // deny rules for all six team tools here for defence in depth.
         const systemPrompt = [
           `You are "${args.memberName}", a ${args.role} on team "${args.teamName}".`,
           `Your lead session ID is: ${team.leadSessionId}.`,
@@ -147,16 +119,8 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           }
         }
 
-        // Fire-and-forget initial prompt
-        await sendAsync(
-          client,
-          sessionId,
-          args.initialPrompt,
-          systemPrompt,
-          modelOpt,
-        );
-
-        // Write member into team state
+        // Write member into team state BEFORE firing the prompt so that state
+        // is always consistent — a live session always has a state record.
         const now = new Date().toISOString();
         await writeTeam({
           ...team,
@@ -172,6 +136,32 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
             },
           },
         });
+
+        // Fire initial prompt; if it throws, mark the member as error so
+        // callers know the session is in an unknown state.
+        try {
+          await client.session.promptAsync({
+            path: { id: sessionId },
+            body: {
+              parts: [{ type: "text" as const, text: args.initialPrompt }],
+              system: systemPrompt,
+              ...(modelOpt !== undefined ? { model: modelOpt } : {}),
+            },
+          });
+        } catch (promptErr) {
+          console.error("[team_spawn] promptAsync failed:", promptErr);
+          try {
+            await updateMember(args.teamName, args.memberName, {
+              status: "error",
+            });
+          } catch (updateErr) {
+            console.error(
+              "[team_spawn] failed to update member status to error:",
+              updateErr,
+            );
+          }
+          return `Error sending initial prompt to member "${args.memberName}": ${String(promptErr)}`;
+        }
 
         return `Member "${args.memberName}" spawned (session: ${sessionId}). Initial prompt sent.`;
       } catch (err) {
@@ -222,13 +212,10 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
         }
 
         const prefixedMessage = `[Team message from ${senderName}]: ${args.message}`;
-        await sendAsync(
-          client,
-          targetSessionId,
-          prefixedMessage,
-          undefined,
-          undefined,
-        );
+        await client.session.promptAsync({
+          path: { id: targetSessionId },
+          body: { parts: [{ type: "text" as const, text: prefixedMessage }] },
+        });
 
         return `Message sent to "${args.to}".`;
       } catch (err) {
@@ -270,13 +257,10 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
             continue;
           }
           try {
-            await sendAsync(
-              client,
-              member.sessionId,
-              prefixedMessage,
-              undefined,
-              undefined,
-            );
+            await client.session.promptAsync({
+              path: { id: member.sessionId },
+              body: { parts: [{ type: "text" as const, text: prefixedMessage }] },
+            });
             messaged.push(memberName);
           } catch (err) {
             console.error(
@@ -389,13 +373,10 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
         const shut: string[] = [];
         for (const target of targets) {
           try {
-            await sendAsync(
-              client,
-              target.sessionId,
-              shutdownMsg,
-              undefined,
-              undefined,
-            );
+            await client.session.promptAsync({
+              path: { id: target.sessionId },
+              body: { parts: [{ type: "text" as const, text: shutdownMsg }] },
+            });
             await updateMember(args.teamName, target.name, {
               status: "shutdown_requested",
             });
@@ -416,6 +397,113 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
     },
   });
 
+  // ---------------------------------------------------------------------------
+  // team_task_add
+  // ---------------------------------------------------------------------------
+  const team_task_add = tool({
+    description: "Add a task to the team's task board.",
+    args: {
+      teamName: z.string().describe("Name of the team"),
+      title: z.string().describe("Short title for the task"),
+      description: z.string().describe("Full description of the task"),
+      assignee: z
+        .string()
+        .optional()
+        .describe("Name of the member to assign the task to (optional)"),
+      dependsOn: z
+        .array(z.string())
+        .optional()
+        .describe("Task IDs this task is blocked by (optional)"),
+    },
+    async execute(args, _context) {
+      try {
+        const team = await readTeam(args.teamName);
+        if (team === null) {
+          return `Error: Team "${args.teamName}" not found.`;
+        }
+        const taskId = `task_${Date.now()}`;
+        const now = new Date().toISOString();
+        await writeTeam({
+          ...team,
+          tasks: {
+            ...team.tasks,
+            [taskId]: {
+              id: taskId,
+              title: args.title,
+              description: args.description,
+              status: "pending",
+              assignee: args.assignee ?? null,
+              dependsOn: args.dependsOn ?? [],
+              createdAt: now,
+            },
+          },
+        });
+        return `Task "${args.title}" added with ID: ${taskId}.`;
+      } catch (err) {
+        console.error("[team_task_add] error:", err);
+        return `Error adding task: ${String(err)}`;
+      }
+    },
+  });
+
+  // ---------------------------------------------------------------------------
+  // team_task_claim
+  // ---------------------------------------------------------------------------
+  const team_task_claim = tool({
+    description:
+      "Claim a pending task, marking it as in_progress. Fails if the task has incomplete dependencies.",
+    args: {
+      teamName: z.string().describe("Name of the team"),
+      taskId: z.string().describe("ID of the task to claim"),
+    },
+    async execute(args, context) {
+      try {
+        // Look up the calling member's name via their session ID
+        const found = await findTeamBySession(context.sessionID);
+        const memberName =
+          found !== null && found.memberName !== "__lead__"
+            ? found.memberName
+            : context.sessionID;
+
+        const result = await claimTask(args.teamName, args.taskId, memberName);
+        if (!result.ok) {
+          return `Error: ${result.reason}`;
+        }
+        return `Task "${args.taskId}" claimed by "${memberName}" and is now in_progress.`;
+      } catch (err) {
+        console.error("[team_task_claim] error:", err);
+        return `Error claiming task: ${String(err)}`;
+      }
+    },
+  });
+
+  // ---------------------------------------------------------------------------
+  // team_task_done
+  // ---------------------------------------------------------------------------
+  const team_task_done = tool({
+    description: "Mark a task as completed and report any newly unblocked tasks.",
+    args: {
+      teamName: z.string().describe("Name of the team"),
+      taskId: z.string().describe("ID of the task to mark as completed"),
+    },
+    async execute(args, _context) {
+      try {
+        const result = await completeTask(args.teamName, args.taskId);
+        if (!result.ok) {
+          return `Error: ${result.reason}`;
+        }
+        const unblockedMsg =
+          result.unblockedTaskIds.length > 0
+            ? ` Newly unblocked: ${result.unblockedTaskIds.join(", ")}.`
+            : "";
+        return `Task "${args.taskId}" marked as completed.${unblockedMsg}`;
+      } catch (err) {
+        console.error("[team_task_done] error:", err);
+        return `Error completing task: ${String(err)}`;
+      }
+    },
+  });
+
   return {
     team_create,
     team_spawn,
@@ -423,6 +511,9 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
     team_broadcast,
     team_status,
     team_shutdown,
+    team_task_add,
+    team_task_claim,
+    team_task_done,
   };
 }
 

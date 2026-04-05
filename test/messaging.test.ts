@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createEventHandler } from "../src/messaging.js";
-import { setTestTeamsDir, writeTeam } from "../src/state.js";
+import { readTeam, setTestTeamsDir, writeTeam } from "../src/state.js";
 
 let tmpDir: string;
 
@@ -160,5 +160,55 @@ describe("createEventHandler", () => {
 
     // No notification since member was already ready
     expect(calls.length).toBe(0);
+  });
+});
+
+describe("recoverStaleMembers (via createEventHandler startup)", () => {
+  it("marks busy and shutdown_requested members as error on startup", async () => {
+    await writeTeam({
+      name: "recovery-team",
+      leadSessionId: "rl-lead",
+      members: {
+        stale_busy: {
+          name: "stale_busy",
+          sessionId: "sb-sess",
+          status: "busy",
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: new Date().toISOString(),
+        },
+        stale_shutdown: {
+          name: "stale_shutdown",
+          sessionId: "ss-sess",
+          status: "shutdown_requested",
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: new Date().toISOString(),
+        },
+        fine_ready: {
+          name: "fine_ready",
+          sessionId: "fr-sess",
+          status: "ready",
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: new Date().toISOString(),
+        },
+      },
+      tasks: {},
+      createdAt: new Date().toISOString(),
+    });
+
+    const { client } = makeStubClient();
+    // createEventHandler fires recoverStaleMembers fire-and-forget
+    createEventHandler(client);
+
+    // Give the async recovery a chance to complete
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const team = await readTeam("recovery-team");
+    expect(team?.members["stale_busy"]?.status).toBe("error");
+    expect(team?.members["stale_shutdown"]?.status).toBe("error");
+    // Non-stale member is untouched
+    expect(team?.members["fine_ready"]?.status).toBe("ready");
   });
 });
