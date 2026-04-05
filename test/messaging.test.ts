@@ -127,10 +127,11 @@ describe("createEventHandler", () => {
       event: { type: "session.idle", properties: { sessionID: "carol-sess" } },
     });
 
-    expect(calls.length).toBe(1);
-    expect(calls[0]?.sessionId).toBe("gamma-lead");
-    expect(calls[0]?.text).toContain("carol");
-    expect(calls[0]?.text).toContain("idle");
+    // Two calls: 1) notification that carol completed, 2) team status render
+    expect(calls.length).toBe(2);
+    const notificationCall = calls.find((c) => c.text.includes("completed a work cycle"));
+    expect(notificationCall?.sessionId).toBe("gamma-lead");
+    expect(notificationCall?.text).toContain("carol");
   });
 
   it("does NOT notify lead when a ready member goes idle", async () => {
@@ -158,8 +159,9 @@ describe("createEventHandler", () => {
       event: { type: "session.idle", properties: { sessionID: "dave-sess" } },
     });
 
-    // No notification since member was already ready
-    expect(calls.length).toBe(0);
+    // Render call fires for all members, but NO notification since dave was already ready
+    expect(calls.length).toBe(1);
+    expect(calls[0]?.text).not.toContain("completed a work cycle");
   });
 });
 

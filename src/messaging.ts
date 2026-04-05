@@ -1,6 +1,15 @@
 import type { PluginInput } from "@opencode-ai/plugin";
 import type { Event } from "@opencode-ai/sdk";
-import { findTeamBySession, listTeams, markStaleMembersAsError, updateMember } from "./state.js";
+import { ansi, renderTeamStatus } from "./renderer.js";
+import {
+  findTeamBySession,
+  listTeams,
+  markStaleMembersAsError,
+  updateMember,
+} from "./state.js";
+
+// leadSessionId_memberName -> last notification timestamp (ms)
+const lastNotified = new Map<string, number>();
 
 type Client = PluginInput["client"];
 
@@ -63,18 +72,8 @@ export function createEventHandler(
 
     const { team, memberName } = found;
 
-    // Lead going idle — check if any members are still busy
+    // Lead going idle — no action needed
     if (memberName === "__lead__") {
-      const busyMembers = Object.values(team.members).filter(
-        (m) => m.status === "busy",
-      );
-      if (busyMembers.length > 0) {
-        const names = busyMembers.map((m) => m.name).join(", ");
-        console.debug(
-          `[opencode-teams] Lead session ${sessionID} is idle but members [${names}] are still busy. ` +
-            `Lead may need to be re-prompted when they finish.`,
-        );
-      }
       return;
     }
 
@@ -95,9 +94,14 @@ export function createEventHandler(
       return;
     }
 
-    // If they were busy, notify the lead
+    // If they were busy, notify the lead (with cooldown)
     if (wasBusy) {
-      const notifyMsg = `[System]: Teammate ${memberName} has gone idle and may need a follow-up or new task.`;
+      const cooldownKey = `${team.leadSessionId}_${memberName}`;
+      const lastTime = lastNotified.get(cooldownKey) ?? 0;
+      if (Date.now() - lastTime < 30_000) return;
+      lastNotified.set(cooldownKey, Date.now());
+
+      const notifyMsg = `[System]: Teammate ${memberName} has completed a work cycle and is now ready. Only send them a new message if you have specific new instructions. If they still have tasks in progress, they will continue without prompting.`;
       try {
         const parts = [{ type: "text" as const, text: notifyMsg }];
         await client.session.promptAsync({
@@ -111,5 +115,16 @@ export function createEventHandler(
         );
       }
     }
+
+    // Render team status meters for the lead
+    try {
+      const leadMsg = ansi.save() + renderTeamStatus(team) + ansi.restore();
+      await client.session.promptAsync({
+        path: { id: team.leadSessionId },
+        body: {
+          parts: [{ type: "text" as const, text: leadMsg }],
+        },
+      });
+    } catch {}
   };
 }
