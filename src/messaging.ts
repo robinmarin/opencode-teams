@@ -88,8 +88,62 @@ export function createEventHandler(
 
     const { team, memberName } = found;
 
-    // Lead session — no action needed for either event type
-    if (memberName === LEAD_MEMBER_NAME) return;
+    // Defensive check: verify sessionId in the index still matches team config
+    const indexedMember = team.members[memberName];
+    if (indexedMember && indexedMember.sessionId !== sessionID) {
+      console.warn(
+        `[opencode-teams] Session index drift detected for ${memberName} in team ${team.name}; expected ${indexedMember.sessionId}, got ${sessionID}; skipping event`,
+      );
+      return;
+    }
+
+    // Lead session — handle anti-loop guard
+    if (memberName === LEAD_MEMBER_NAME) {
+      // session.status for lead is always ignored (idle transitions handled by session.idle)
+      if (event.type === "session.status") return;
+
+      // Lead idle: check if members are still busy/retrying
+      const busyMembers = Object.entries(team.members).filter(
+        ([name, m]) =>
+          name !== LEAD_MEMBER_NAME &&
+          (m.status === "busy" || m.status === "retrying"),
+      );
+
+      if (busyMembers.length > 0) {
+        const content = `Lead idle — ${busyMembers.length} member(s) still busy`;
+
+        // Post system event to channel so lead sees it in team history
+        try {
+          await appendEvent(team.name, {
+            type: "system",
+            sender: LEAD_MEMBER_NAME,
+            senderId: sessionID,
+            content,
+          });
+        } catch (err) {
+          console.error(
+            `[opencode-teams] Failed to post system event for lead idle:`,
+            err,
+          );
+        }
+
+        // Surface to lead via promptAsync (plain text)
+        try {
+          await client.session.promptAsync({
+            path: { id: team.leadSessionId },
+            body: {
+              parts: [{ type: "text" as const, text: content }],
+            },
+          });
+        } catch (err) {
+          console.error(
+            `[opencode-teams] Failed to prompt lead about busy members:`,
+            err,
+          );
+        }
+      }
+      return;
+    }
 
     const member = team.members[memberName];
     if (member === undefined) return;

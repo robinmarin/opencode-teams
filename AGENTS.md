@@ -20,7 +20,7 @@ bun test test/state.test.ts
 
 The plugin exposes a single `TeamPlugin` export (`src/index.ts`) conforming to `@opencode-ai/plugin`'s `Plugin` type. On init it receives a live `OpencodeClient` and returns two hooks:
 
-- **`tool`** — six tools built by `createTools(client)` in `src/tools.ts`
+- **`tool`** — 15 tools built by `createTools(client)` in `src/tools.ts`
 - **`event`** — an event handler built by `createEventHandler(client)` in `src/messaging.ts`
 
 ### State (`src/state.ts`)
@@ -31,7 +31,7 @@ Team configs are persisted as JSON at `~/.config/opencode/teams/<name>/config.js
 
 ### Tools (`src/tools.ts`)
 
-All six tools use `tool.schema` (the plugin's bundled Zod instance, v4.1.8) rather than importing `zod` directly. Importing from the root `zod` package causes a version-mismatch type error because the plugin vendors its own copy.
+All 15 tools use `tool.schema` (the plugin's bundled Zod instance, v4.1.8) rather than importing `zod` directly. Importing from the root `zod` package causes a version-mismatch type error because the plugin vendors its own copy.
 
 `session.create` has no system-prompt field; member role context is injected via the `system` field in the first `session.promptAsync` call.
 

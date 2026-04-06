@@ -27,18 +27,6 @@ const STATUS_COLORS: Record<string, string> = {
   shutdown: ansi.dim(),
 };
 
-function progressBar(pct: number, width = 20): string {
-  const filled = Math.round((pct / 100) * width);
-  const empty = width - filled;
-  return (
-    ansi.fg(6) +
-    "█".repeat(Math.max(0, filled)) +
-    ansi.dim() +
-    "░".repeat(Math.max(0, empty)) +
-    ansi.reset()
-  );
-}
-
 function formatAge(isoString: string): string {
   const ms = Date.now() - new Date(isoString).getTime();
   const s = Math.floor(ms / 1000);
@@ -55,28 +43,23 @@ function memberLine(
   role: string,
   currentTask: string,
   age: string,
+  _spawnedAt: string,
 ): string {
   const color = STATUS_COLORS[status] ?? ansi.reset();
   const padName = name.padEnd(14, " ");
   const padRole = role.padEnd(18, " ");
 
-  let activityPct = 0;
   let stateTag = status;
   if (status === "ready") {
-    activityPct = 0;
     stateTag = "idle";
   } else if (status === "busy") {
-    activityPct = 50 + Math.floor(Math.random() * 40);
     stateTag = "working";
   } else if (status === "retrying") {
-    activityPct = 20;
     stateTag = "retrying";
   } else if (status === "error") {
-    activityPct = 100;
     stateTag = "ERROR";
   }
 
-  const bar = progressBar(activityPct);
   const colorTag =
     status === "error"
       ? ansi.fg(1)
@@ -90,7 +73,7 @@ function memberLine(
     `${ansi.save()}` +
     `${ansi.clearLine()}` +
     `${color}${padName}${ansi.reset()}` +
-    ` ${bar} ${tag}` +
+    ` ${tag}` +
     ` ${padRole}` +
     `${ansi.dim()}│${ansi.reset()} ` +
     `${currentTask || "(no task)"} ` +
@@ -117,7 +100,17 @@ export function renderTeamStatus(team: TeamConfig, maxRows = 8): string {
     if (!m) continue;
     const age = formatAge(m.spawnedAt);
     const currentTask = m.status === "busy" ? "processing..." : "";
-    lines.push(memberLine(i + 2, m.name, m.status, "member", currentTask, age));
+    lines.push(
+      memberLine(
+        i + 2,
+        m.name,
+        m.status,
+        "member",
+        currentTask,
+        age,
+        m.spawnedAt as string,
+      ),
+    );
   }
 
   for (let i = members.length; i < maxRows - 2; i++) {

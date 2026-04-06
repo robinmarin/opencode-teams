@@ -1,3 +1,4 @@
+import * as fs from "node:fs/promises";
 import type { PluginInput, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import {
@@ -9,9 +10,11 @@ import {
   isMemberActive,
   isMemberShutdown,
   LEAD_MEMBER_NAME,
+  listTeams,
   pruneEvents,
   readTeam,
   resolveSenderName,
+  teamDir,
   updateMember,
   writeTeam,
 } from "./state.js";
@@ -121,42 +124,64 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           return `Error: Member "${args.memberName}" already exists in team "${args.teamName}".`;
         }
 
-        // Create the new session
-        const createResult = await client.session.create({
-          body: { title: `[${args.teamName}] ${args.memberName}` },
-        });
-        if (createResult.error !== undefined) {
-          return `Error creating session for member: ${JSON.stringify(createResult.error)}`;
-        }
-        const sessionId = createResult.data.id;
+        const sessionCreateRetries = [1000, 2000, 4000] as const;
+        const promptRetries = [500, 1000] as const;
+        let sessionId: string | undefined;
+        let sessionCreateErr: unknown;
 
-        // Known limitation: @opencode-ai/sdk session.create() only accepts
-        // { parentID, title } in its body — there is no deny list or permissions
-        // field. Sub-agent tool isolation is therefore instruction-only. A
-        // future SDK version may expose a deny list; at that point add explicit
-        // deny rules for all six team tools here for defence in depth.
-        const systemPrompt = [
-          `You are "${args.memberName}", a ${args.role} on team "${args.teamName}".`,
-          `Your lead session ID is: ${team.leadSessionId}.`,
-          `You were spawned to work on specific tasks. Complete them thoroughly.`,
-          `IMPORTANT: You must NOT use team management tools (team_create, team_spawn, team_message, team_broadcast, team_status, team_shutdown). These tools are reserved for the team lead only.`,
-          `When you complete a task, summarize your results clearly so the lead can review them.`,
-        ].join("\n");
+        for (let attempt = 0; attempt <= 3; attempt++) {
+          if (attempt > 0) {
+            const delay = sessionCreateRetries[attempt - 1] as number;
+            await new Promise((res) => setTimeout(res, delay));
+            try {
+              await updateMember(args.teamName, args.memberName, {
+                status: "retrying",
+                retryAttempt: attempt,
+                retryNextMs: delay,
+              });
+            } catch (updateErr) {
+              console.error(
+                "[team_spawn] failed to update member status to retrying:",
+                updateErr,
+              );
+            }
+          }
 
-        // Parse optional model selector
-        let modelOpt: { providerID: string; modelID: string } | undefined;
-        if (typeof args.model === "string") {
-          const slashIdx = args.model.indexOf("/");
-          if (slashIdx !== -1) {
-            modelOpt = {
-              providerID: args.model.slice(0, slashIdx),
-              modelID: args.model.slice(slashIdx + 1),
-            };
+          const createResult = await client.session.create({
+            body: { title: `[${args.teamName}] ${args.memberName}` },
+          });
+
+          if (createResult.error === undefined) {
+            sessionId = createResult.data.id;
+            break;
+          }
+
+          sessionCreateErr = createResult.error;
+
+          if (attempt === 3) {
+            try {
+              await updateMember(
+                args.teamName,
+                args.memberName,
+                {
+                  status: "error",
+                },
+                ["retryAttempt", "retryNextMs"],
+              );
+            } catch (updateErr) {
+              console.error(
+                "[team_spawn] failed to update member status to error:",
+                updateErr,
+              );
+            }
+            return `Error creating session for member: ${JSON.stringify(sessionCreateErr)}`;
           }
         }
 
-        // Write member into team state BEFORE firing the prompt so that state
-        // is always consistent — a live session always has a state record.
+        if (sessionId === undefined) {
+          throw new Error("session ID not created");
+        }
+
         const now = new Date().toISOString();
         await writeTeam({
           ...team,
@@ -173,30 +198,77 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           },
         });
 
-        // Fire initial prompt; if it throws, mark the member as error so
-        // callers know the session is in an unknown state.
-        try {
-          await client.session.promptAsync({
-            path: { id: sessionId },
-            body: {
-              parts: [{ type: "text" as const, text: args.initialPrompt }],
-              system: systemPrompt,
-              ...(modelOpt !== undefined ? { model: modelOpt } : {}),
-            },
-          });
-        } catch (promptErr) {
-          console.error("[team_spawn] promptAsync failed:", promptErr);
-          try {
-            await updateMember(args.teamName, args.memberName, {
-              status: "error",
-            });
-          } catch (updateErr) {
-            console.error(
-              "[team_spawn] failed to update member status to error:",
-              updateErr,
-            );
+        const systemPrompt = [
+          `You are "${args.memberName}", a ${args.role} on team "${args.teamName}".`,
+          `Your lead session ID is: ${team.leadSessionId}.`,
+          `You were spawned to work on specific tasks. Complete them thoroughly.`,
+          `IMPORTANT: You must NOT use team management tools (team_create, team_spawn, team_message, team_broadcast, team_status, team_shutdown). These tools are reserved for the team lead only.`,
+          `When you complete a task, summarize your results clearly so the lead can review them.`,
+        ].join("\n");
+
+        let modelOpt: { providerID: string; modelID: string } | undefined;
+        if (typeof args.model === "string") {
+          const slashIdx = args.model.indexOf("/");
+          if (slashIdx !== -1) {
+            modelOpt = {
+              providerID: args.model.slice(0, slashIdx),
+              modelID: args.model.slice(slashIdx + 1),
+            };
           }
-          return `Error sending initial prompt to member "${args.memberName}": ${String(promptErr)}`;
+        }
+
+        let promptErr: unknown;
+        for (let attempt = 0; attempt <= 2; attempt++) {
+          if (attempt > 0) {
+            const delay = promptRetries[attempt - 1] as number;
+            await new Promise((res) => setTimeout(res, delay));
+            try {
+              await updateMember(args.teamName, args.memberName, {
+                status: "retrying",
+                retryAttempt: attempt,
+                retryNextMs: delay,
+              });
+            } catch (updateErr) {
+              console.error(
+                "[team_spawn] failed to update member status to retrying:",
+                updateErr,
+              );
+            }
+          }
+
+          try {
+            await client.session.promptAsync({
+              path: { id: sessionId },
+              body: {
+                parts: [{ type: "text" as const, text: args.initialPrompt }],
+                system: systemPrompt,
+                ...(modelOpt !== undefined ? { model: modelOpt } : {}),
+              },
+            });
+            promptErr = undefined;
+            break;
+          } catch (err) {
+            promptErr = err;
+
+            if (attempt === 2) {
+              try {
+                await updateMember(
+                  args.teamName,
+                  args.memberName,
+                  {
+                    status: "error",
+                  },
+                  ["retryAttempt", "retryNextMs"],
+                );
+              } catch (updateErr) {
+                console.error(
+                  "[team_spawn] failed to update member status to error:",
+                  updateErr,
+                );
+              }
+              return `Error sending initial prompt to member "${args.memberName}": ${String(promptErr)}`;
+            }
+          }
         }
 
         return `Member "${args.memberName}" spawned (session: ${sessionId}). Initial prompt sent.`;
@@ -872,6 +944,223 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
     },
   });
 
+  // ---------------------------------------------------------------------------
+  // team_list
+  // ---------------------------------------------------------------------------
+  const team_list = tool({
+    description:
+      "List all existing teams. Returns array of team names with basic info (member count, task count, created date).",
+    args: {},
+    async execute(_args, _context) {
+      try {
+        const names = await listTeams();
+        if (names.length === 0) {
+          return "No teams exist yet.";
+        }
+
+        const lines: string[] = [];
+        for (const name of names) {
+          const team = await readTeam(name);
+          if (team === null) continue;
+          const memberCount = Object.keys(team.members).length;
+          const taskCount = Object.keys(team.tasks).length;
+          lines.push(
+            `  - ${team.name}: ${memberCount} member(s), ${taskCount} task(s), created=${team.createdAt}`,
+          );
+        }
+        return ["Teams:", ...lines].join("\n");
+      } catch (err) {
+        console.error("[team_list] error:", err);
+        return `Error listing teams: ${String(err)}`;
+      }
+    },
+  });
+
+  // ---------------------------------------------------------------------------
+  // team_delete
+  // ---------------------------------------------------------------------------
+  const team_delete = tool({
+    description:
+      "Delete/dissolve a team. Only the lead can do this. Removes the team's config directory entirely.",
+    args: {
+      teamName: z.string().describe("Name of the team to delete"),
+    },
+    async execute(args, context) {
+      try {
+        const team = await readTeam(args.teamName);
+        if (team === null) {
+          return `Error: Team "${args.teamName}" not found.`;
+        }
+
+        if (team.leadSessionId !== context.sessionID) {
+          return `Error: Only the team lead can delete the team.`;
+        }
+
+        const memberNames = Object.keys(team.members);
+        if (memberNames.length > 0) {
+          return `Warning: Team "${args.teamName}" has ${memberNames.length} active member(s): ${memberNames.join(", ")}. Shutdown members first with team_shutdown, then retry.`;
+        }
+
+        const dir = teamDir(args.teamName);
+        await fs.rm(dir, { recursive: true, force: true });
+        return `Team "${args.teamName}" deleted.`;
+      } catch (err) {
+        console.error("[team_delete] error:", err);
+        return `Error deleting team: ${String(err)}`;
+      }
+    },
+  });
+
+  // ---------------------------------------------------------------------------
+  // team_task_list
+  // ---------------------------------------------------------------------------
+  const team_task_list = tool({
+    description: "List all tasks for a team with optional status filtering.",
+    args: {
+      teamName: z.string().describe("Name of the team"),
+      status: z
+        .enum(["pending", "in_progress", "completed", "blocked"])
+        .optional()
+        .describe("Filter tasks by status"),
+    },
+    async execute(args, _context) {
+      try {
+        const team = await readTeam(args.teamName);
+        if (team === null) {
+          return `Error: Team "${args.teamName}" not found.`;
+        }
+
+        const tasks = Object.values(team.tasks);
+        const filtered = args.status
+          ? tasks.filter((t) => t.status === args.status)
+          : tasks;
+
+        if (filtered.length === 0) {
+          return `No tasks found${args.status ? ` with status "${args.status}"` : ""} in team "${args.teamName}".`;
+        }
+
+        const lines = filtered.map(
+          (t) =>
+            `  - [${t.status}] ${t.id}: ${t.title} (assignee: ${t.assignee ?? "unassigned"})${t.dependsOn.length > 0 ? ` blocked by: ${t.dependsOn.join(", ")}` : ""}`,
+        );
+        return [
+          `Tasks in "${args.teamName}"${args.status ? ` (${args.status})` : ""}:`,
+          ...lines,
+        ].join("\n");
+      } catch (err) {
+        console.error("[team_task_list] error:", err);
+        return `Error listing tasks: ${String(err)}`;
+      }
+    },
+  });
+
+  // ---------------------------------------------------------------------------
+  // team_task_update
+  // ---------------------------------------------------------------------------
+  const team_task_update = tool({
+    description: "Update task fields (title, description, assignee).",
+    args: {
+      teamName: z.string().describe("Name of the team"),
+      taskId: z.string().describe("ID of the task to update"),
+      title: z.string().optional().describe("New title for the task"),
+      description: z
+        .string()
+        .optional()
+        .describe("New description for the task"),
+      assignee: z
+        .string()
+        .optional()
+        .describe("New assignee for the task (use null to unassign)"),
+    },
+    async execute(args, _context) {
+      try {
+        const team = await readTeam(args.teamName);
+        if (team === null) {
+          return `Error: Team "${args.teamName}" not found.`;
+        }
+
+        const task = team.tasks[args.taskId];
+        if (task === undefined) {
+          return `Error: Task "${args.taskId}" not found in team "${args.teamName}".`;
+        }
+
+        if (
+          args.title === undefined &&
+          args.description === undefined &&
+          args.assignee === undefined
+        ) {
+          return `Error: No fields to update. Provide at least one of: title, description, assignee.`;
+        }
+
+        await writeTeam({
+          ...team,
+          tasks: {
+            ...team.tasks,
+            [args.taskId]: {
+              ...task,
+              ...(args.title !== undefined ? { title: args.title } : {}),
+              ...(args.description !== undefined
+                ? { description: args.description }
+                : {}),
+              ...(args.assignee !== undefined
+                ? { assignee: args.assignee }
+                : {}),
+            },
+          },
+        });
+
+        return `Task "${args.taskId}" updated.`;
+      } catch (err) {
+        console.error("[team_task_update] error:", err);
+        return `Error updating task: ${String(err)}`;
+      }
+    },
+  });
+
+  // ---------------------------------------------------------------------------
+  // team_member_info
+  // ---------------------------------------------------------------------------
+  const team_member_info = tool({
+    description: "Get detailed info about a specific member.",
+    args: {
+      teamName: z.string().describe("Name of the team"),
+      memberName: z.string().describe("Name of the member to get info about"),
+    },
+    async execute(args, _context) {
+      try {
+        const team = await readTeam(args.teamName);
+        if (team === null) {
+          return `Error: Team "${args.teamName}" not found.`;
+        }
+
+        const member = team.members[args.memberName];
+        if (member === undefined) {
+          return `Error: Member "${args.memberName}" not found in team "${args.teamName}".`;
+        }
+
+        const currentTask = Object.values(team.tasks).find(
+          (t) => t.assignee === args.memberName && t.status === "in_progress",
+        );
+
+        const lines = [
+          `Member: ${member.name}`,
+          `Session ID: ${member.sessionId}`,
+          `Status: ${member.status}`,
+          `Model: ${member.model}`,
+          `Agent type: ${member.agentType}`,
+          `Spawned at: ${member.spawnedAt}`,
+          ...(currentTask
+            ? [`Current task: ${currentTask.id} - ${currentTask.title}`]
+            : []),
+        ];
+        return lines.join("\n");
+      } catch (err) {
+        console.error("[team_member_info] error:", err);
+        return `Error getting member info: ${String(err)}`;
+      }
+    },
+  });
+
   return {
     team_create,
     team_spawn,
@@ -888,6 +1177,11 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
     team_announce,
     team_react,
     team_prune,
+    team_list,
+    team_delete,
+    team_task_list,
+    team_task_update,
+    team_member_info,
   };
 }
 

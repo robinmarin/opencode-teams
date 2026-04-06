@@ -6,6 +6,7 @@
   "main": "./dist/index.js",
   "exports": {
     ".": "./dist/index.js",
+    "./server": "./dist/index.js",
     "./tui": "./dist/tui.jsx"
   },
   "files": [

@@ -73,7 +73,7 @@ describe("createEventHandler", () => {
     expect(calls.length).toBe(0);
   });
 
-  it("does NOT auto-prompt lead when lead goes idle with busy members", async () => {
+  it("posts system event and notifies lead when lead goes idle with busy members", async () => {
     await writeTeam({
       name: "beta",
       leadSessionId: "lead-sess",
@@ -98,8 +98,15 @@ describe("createEventHandler", () => {
       event: { type: "session.idle", properties: { sessionID: "lead-sess" } },
     });
 
-    // Must NOT prompt lead automatically
-    expect(calls.filter((c) => c.sessionId === "lead-sess").length).toBe(0);
+    // Must prompt lead with system message
+    const leadCalls = calls.filter((c) => c.sessionId === "lead-sess");
+    expect(leadCalls.length).toBe(1);
+    expect(leadCalls[0].text).toBe("Lead idle — 1 member(s) still busy");
+
+    // System event should be posted
+    const { events } = await getEvents("beta", 10);
+    const systemEvent = events.find((e) => e.type === "system");
+    expect(systemEvent?.content).toBe("Lead idle — 1 member(s) still busy");
   });
 
   it("notifies lead when a busy team member goes idle", async () => {

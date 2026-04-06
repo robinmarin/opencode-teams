@@ -1,5 +1,7 @@
 # opencode-teams Plugin — Implementation Plan
 
+> **Note:** This document is historical. The implementation now includes 15 tools (not 6). Some tool listings and architectural details below may be outdated. For current tool documentation, see README.md.
+
 ## Phase 1 Research Summary
 
 ### Source 1 & 2: anomalyco/opencode#12711 and dev.to article

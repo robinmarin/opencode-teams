@@ -12,9 +12,15 @@ An [OpenCode](https://opencode.ai) plugin that adds agent teams — spawn, coord
 | `team_broadcast` | Send a message to all active members. |
 | `team_status` | Show member statuses and task counts. |
 | `team_shutdown` | Shut down one or all members. |
+| `team_interrupt` | Interrupt a busy member mid-task and deliver a priority message. |
 | `team_task_add` | Add a task to the team's task board. |
 | `team_task_claim` | Claim a pending task (respects dependency ordering). |
 | `team_task_done` | Mark a task as completed and report newly unblocked tasks. |
+| `team_post` | Post a message to the team's channel. Supports @mentions. |
+| `team_history` | Read recent messages from the team's channel history. |
+| `team_announce` | Broadcast a message to all active members including the sender. |
+| `team_react` | Add a reaction to a channel message. |
+| `team_prune` | Compact the events log, keeping only the most recent N entries. |
 
 ## How it works
 
@@ -32,7 +38,7 @@ Add to `~/.config/opencode/opencode.json`:
 }
 ```
 
-Restart OpenCode. The nine team tools will be available in your session.
+Restart OpenCode. The 15 team tools will be available in your session.
 
 ## Local Development
 
@@ -126,7 +132,7 @@ State is read directly from `~/.config/opencode/teams/*/config.json` via `fs.wat
 
 ## Known Limitations
 
-**Sub-agent tool isolation is instruction-only.** The `@opencode-ai/sdk` `session.create()` body only accepts `{ parentID, title }` — there is no deny list or permissions field. Sub-agents are told not to use team tools via their system prompt, but a model could ignore this instruction. A future SDK version may expose per-session deny rules; at that point the six team tools should be explicitly denied for all spawned sessions.
+**Sub-agent tool isolation is instruction-only.** The `@opencode-ai/sdk` `session.create()` body only accepts `{ parentID, title }` — there is no deny list or permissions field. Sub-agents are told not to use team tools via their system prompt, but a model could ignore this instruction. A future SDK version may expose per-session deny rules; at that point the 15 team tools should be explicitly denied for all spawned sessions.
 
 **Mid-turn idle notification race.** If the lead session is mid-turn (actively generating a response) when a teammate goes idle, the `session.idle` event fires and the plugin sends a `promptAsync` to the lead. OpenCode queues this message; the lead will not re-enter its loop until the current turn completes. There is no mechanism to interrupt an in-progress turn.
 

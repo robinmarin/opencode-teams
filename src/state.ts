@@ -118,7 +118,7 @@ function teamsDir(): string {
   return path.join(os.homedir(), ".config", "opencode", "teams");
 }
 
-function teamDir(name: string): string {
+export function teamDir(name: string): string {
   return path.join(teamsDir(), name);
 }
 
