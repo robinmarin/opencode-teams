@@ -1,5 +1,6 @@
 import type { PluginInput } from "@opencode-ai/plugin";
 import type { Event } from "@opencode-ai/sdk";
+import type { Logger } from "./logger.js";
 import { renderTeamStatusPlain } from "./renderer.js";
 import type { TeamConfig } from "./state.js";
 import {
@@ -58,8 +59,11 @@ async function recoverStaleMembers(): Promise<void> {
  *     Lead going idle   → no action (anti-loop guard)
  *     Member going idle → status = "ready"; if was busy/retrying, notify lead
  */
+type GetLogger = (client: Client, teamName: string) => Logger;
+
 export function createEventHandler(
   client: Client,
+  getLogger: GetLogger,
 ): (input: { event: Event }) => Promise<void> {
   // Fire-and-forget startup recovery — do not block plugin init
   recoverStaleMembers().catch((err) => {
@@ -74,7 +78,12 @@ export function createEventHandler(
 
     // Fast pre-check: if the index is populated and this session is absent,
     // it is definitely not a team session — skip the disk scan entirely.
-    if (sessionIndexSize() > 0 && !isKnownSession(sessionID)) return;
+    const indexSize = sessionIndexSize();
+    if (indexSize > 0 && !isKnownSession(sessionID)) return;
+
+    console.debug(
+      `[opencode-teams] event=${event.type} sessionID=${sessionID} indexSize=${indexSize}`,
+    );
 
     let found: Awaited<ReturnType<typeof findTeamBySession>>;
     try {
@@ -84,23 +93,43 @@ export function createEventHandler(
       return;
     }
 
-    if (found === null) return;
+    if (found === null) {
+      console.debug(
+        `[opencode-teams] session ${sessionID} not found in any team; ignoring`,
+      );
+      return;
+    }
 
     const { team, memberName } = found;
+    const log = getLogger(client, team.name);
+
+    log.debug("messaging", `event received`, {
+      eventType: event.type,
+      sessionId: sessionID,
+      memberName,
+      teamName: team.name,
+    });
 
     // Defensive check: verify sessionId in the index still matches team config
     const indexedMember = team.members[memberName];
     if (indexedMember && indexedMember.sessionId !== sessionID) {
-      console.warn(
-        `[opencode-teams] Session index drift detected for ${memberName} in team ${team.name}; expected ${indexedMember.sessionId}, got ${sessionID}; skipping event`,
-      );
+      log.warn("messaging", "session index drift detected; skipping event", {
+        memberName,
+        expectedSessionId: indexedMember.sessionId,
+        receivedSessionId: sessionID,
+      });
       return;
     }
 
     // Lead session — handle anti-loop guard
     if (memberName === LEAD_MEMBER_NAME) {
       // session.status for lead is always ignored (idle transitions handled by session.idle)
-      if (event.type === "session.status") return;
+      if (event.type === "session.status") {
+        log.debug("messaging", "lead session.status ignored (anti-loop)", {
+          sessionId: sessionID,
+        });
+        return;
+      }
 
       // Lead idle: check if members are still busy/retrying
       const busyMembers = Object.entries(team.members).filter(
@@ -108,6 +137,12 @@ export function createEventHandler(
           name !== LEAD_MEMBER_NAME &&
           (m.status === "busy" || m.status === "retrying"),
       );
+
+      log.debug("messaging", "lead went idle", {
+        sessionId: sessionID,
+        busyMemberCount: busyMembers.length,
+        busyMembers: busyMembers.map(([n]) => n),
+      });
 
       if (busyMembers.length > 0) {
         const content = `Lead idle — ${busyMembers.length} member(s) still busy`;
@@ -120,33 +155,53 @@ export function createEventHandler(
             senderId: sessionID,
             content,
           });
+          log.debug("messaging", "posted lead-idle system event to channel");
         } catch (err) {
-          console.error(
-            `[opencode-teams] Failed to post system event for lead idle:`,
-            err,
-          );
+          log.error("messaging", "failed to post lead-idle system event", {
+            error: String(err),
+          });
         }
 
         // Surface to lead via promptAsync (plain text)
+        log.debug("messaging", "prompting lead about busy members", {
+          leadSessionId: team.leadSessionId,
+          busyMemberCount: busyMembers.length,
+        });
         try {
-          await client.session.promptAsync({
+          const result = await client.session.promptAsync({
             path: { id: team.leadSessionId },
             body: {
               parts: [{ type: "text" as const, text: content }],
             },
           });
+          if (result.error !== undefined) {
+            log.error("messaging", "promptAsync returned error for lead", {
+              leadSessionId: team.leadSessionId,
+              error: JSON.stringify(result.error),
+            });
+          } else {
+            log.info("messaging", "lead notified of busy members", {
+              leadSessionId: team.leadSessionId,
+            });
+          }
         } catch (err) {
-          console.error(
-            `[opencode-teams] Failed to prompt lead about busy members:`,
-            err,
-          );
+          log.error("messaging", "promptAsync threw for lead (busy-members notice)", {
+            leadSessionId: team.leadSessionId,
+            error: String(err),
+          });
         }
       }
       return;
     }
 
     const member = team.members[memberName];
-    if (member === undefined) return;
+    if (member === undefined) {
+      log.warn("messaging", "member found by session index but missing from team config", {
+        memberName,
+        sessionId: sessionID,
+      });
+      return;
+    }
 
     // -----------------------------------------------------------------------
     // session.status — update member status silently; no lead notification.
@@ -154,7 +209,13 @@ export function createEventHandler(
     // -----------------------------------------------------------------------
     if (event.type === "session.status") {
       const { status } = event.properties;
-      if (status.type === "idle") return; // let session.idle handle it
+      if (status.type === "idle") {
+        log.debug("messaging", "session.status idle ignored; waiting for session.idle", {
+          memberName,
+          sessionId: sessionID,
+        });
+        return;
+      }
 
       // SDK uses "retry"; our MemberStatus uses "retrying"
       const newStatus =
@@ -173,13 +234,24 @@ export function createEventHandler(
           ? (["retryAttempt", "retryNextMs"] as (keyof typeof member)[])
           : undefined;
 
+      log.debug("messaging", "updating member status from session.status", {
+        memberName,
+        previousStatus: member.status,
+        newStatus,
+        sessionId: sessionID,
+      });
       try {
         await updateMember(team.name, memberName, patch, clearFields);
+        log.info("messaging", "member status updated", {
+          memberName,
+          newStatus,
+        });
       } catch (err) {
-        console.error(
-          `[opencode-teams] Failed to update member ${memberName} status to ${newStatus}:`,
-          err,
-        );
+        log.error("messaging", "failed to update member status", {
+          memberName,
+          newStatus,
+          error: String(err),
+        });
       }
       return;
     }
@@ -189,6 +261,14 @@ export function createEventHandler(
     // -----------------------------------------------------------------------
     const wasBusy = member.status === "busy" || member.status === "retrying";
 
+    log.info("messaging", "member session idle", {
+      memberName,
+      sessionId: sessionID,
+      previousStatus: member.status,
+      wasBusy,
+      leadSessionId: team.leadSessionId,
+    });
+
     // Update member status to ready; clear any retry context
     try {
       await updateMember(team.name, memberName, { status: "ready" }, [
@@ -196,11 +276,12 @@ export function createEventHandler(
         "retryNextMs",
         "currentTask",
       ]);
+      log.debug("messaging", "member status set to ready", { memberName });
     } catch (err) {
-      console.error(
-        `[opencode-teams] Failed to update member ${memberName} status to ready:`,
-        err,
-      );
+      log.error("messaging", "failed to set member status to ready", {
+        memberName,
+        error: String(err),
+      });
       return;
     }
 
@@ -228,6 +309,13 @@ export function createEventHandler(
       const elapsed = Date.now() - lastTime;
       const COOLDOWN_MS = 5_000;
 
+      log.debug("messaging", "cooldown check for status event", {
+        memberName,
+        elapsedMs: elapsed,
+        cooldownMs: COOLDOWN_MS,
+        withinCooldown: elapsed < COOLDOWN_MS,
+      });
+
       if (elapsed < COOLDOWN_MS) {
         // Queue the channel event; the render below still fires immediately.
         const delay = COOLDOWN_MS - elapsed;
@@ -239,10 +327,10 @@ export function createEventHandler(
             senderId: member.sessionId,
             content: `${memberName} is now ready`,
           }).catch((err) => {
-            console.error(
-              `[opencode-teams] Failed to post queued status event for ${memberName}:`,
-              err,
-            );
+            log.error("messaging", "failed to post queued status event", {
+              memberName,
+              error: String(err),
+            });
           });
         }, delay);
       } else {
@@ -254,19 +342,24 @@ export function createEventHandler(
             senderId: member.sessionId,
             content: `${memberName} is now ready`,
           });
+          log.debug("messaging", "status event posted to channel", { memberName });
         } catch (err) {
-          console.error(
-            `[opencode-teams] Failed to post status event for ${memberName}:`,
-            err,
-          );
+          log.error("messaging", "failed to post status event to channel", {
+            memberName,
+            error: String(err),
+          });
         }
       }
     }
 
     // Send a plain-text team status summary to the lead.
     // Plain text (no ANSI escapes) so the model receives clean, readable context.
+    log.debug("messaging", "sending team status to lead via promptAsync", {
+      memberName,
+      leadSessionId: team.leadSessionId,
+    });
     try {
-      await client.session.promptAsync({
+      const result = await client.session.promptAsync({
         path: { id: team.leadSessionId },
         body: {
           parts: [
@@ -274,11 +367,24 @@ export function createEventHandler(
           ],
         },
       });
+      if (result.error !== undefined) {
+        log.error("messaging", "promptAsync returned error when notifying lead", {
+          memberName,
+          leadSessionId: team.leadSessionId,
+          error: JSON.stringify(result.error),
+        });
+      } else {
+        log.info("messaging", "lead notified of member idle", {
+          memberName,
+          leadSessionId: team.leadSessionId,
+        });
+      }
     } catch (err) {
-      console.error(
-        `[opencode-teams] Failed to send team status to lead ${team.leadSessionId}:`,
-        err,
-      );
+      log.error("messaging", "promptAsync threw when notifying lead", {
+        memberName,
+        leadSessionId: team.leadSessionId,
+        error: String(err),
+      });
     }
   };
 }

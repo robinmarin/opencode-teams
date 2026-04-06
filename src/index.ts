@@ -58,7 +58,7 @@ export function getOrCreateTeamLogger(
 const TeamPlugin: Plugin = async ({ client }) => {
   initTeamLoggers(client);
   return {
-    event: createEventHandler(client),
+    event: createEventHandler(client, getOrCreateTeamLogger),
     tool: createTools(client, getOrCreateTeamLogger),
   };
 };
