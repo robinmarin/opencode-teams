@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import type { PluginInput, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
+import type { Logger } from "./logger.js";
 import {
   appendEvent,
   claimTask,
@@ -12,6 +13,7 @@ import {
   LEAD_MEMBER_NAME,
   listTeams,
   pruneEvents,
+  readDebugLogs,
   readTeam,
   resolveSenderName,
   teamDir,
@@ -29,7 +31,10 @@ type Client = PluginInput["client"];
 // tool definitions
 // ---------------------------------------------------------------------------
 
-function makeTools(client: Client): Record<string, ToolDefinition> {
+function makeTools(
+  client: Client,
+  _getLogger: (client: Client, teamName: string) => Logger,
+): Record<string, ToolDefinition> {
   // ---------------------------------------------------------------------------
   // team_create
   // ---------------------------------------------------------------------------
@@ -41,9 +46,18 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
       description: z.string().optional().describe("Optional team description"),
     },
     async execute(args, context) {
+      const log = _getLogger(client, args.name);
+      log.debug("tool", "team_create called", {
+        name: args.name,
+        hasDescription: args.description !== undefined,
+        sessionId: context.sessionID,
+      });
       try {
         const existing = await readTeam(args.name);
         if (existing !== null) {
+          log.warn("tool", "team_create skipped — team already exists", {
+            name: args.name,
+          });
           return `Error: Team "${args.name}" already exists.`;
         }
         await writeTeam({
@@ -52,6 +66,10 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           members: {},
           tasks: {},
           createdAt: new Date().toISOString(),
+        });
+        log.info("tool", "team created", {
+          name: args.name,
+          leadSessionId: context.sessionID,
         });
 
         // SDK audit: @opencode-ai/sdk exposes no silent system-prompt injection
@@ -84,6 +102,10 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
 
         return `Team "${args.name}" created. You are the lead (session: ${context.sessionID}).`;
       } catch (err) {
+        log.error("tool", "team_create failed", {
+          name: args.name,
+          error: String(err),
+        });
         console.error("[team_create] error:", err);
         return `Error creating team: ${String(err)}`;
       }
@@ -115,12 +137,25 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
         ),
     },
     async execute(args, _context) {
+      const log = _getLogger(client, args.teamName);
+      log.debug("tool", "team_spawn called", {
+        memberName: args.memberName,
+        role: args.role,
+        model: args.model,
+      });
       try {
         const team = await readTeam(args.teamName);
         if (team === null) {
+          log.warn("tool", "team_spawn skipped — team not found", {
+            teamName: args.teamName,
+          });
           return `Error: Team "${args.teamName}" does not exist. Create it first with team_create.`;
         }
         if (team.members[args.memberName] !== undefined) {
+          log.warn("tool", "team_spawn skipped — member already exists", {
+            teamName: args.teamName,
+            memberName: args.memberName,
+          });
           return `Error: Member "${args.memberName}" already exists in team "${args.teamName}".`;
         }
 
@@ -271,14 +306,26 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           }
         }
 
+        log.info("tool", "member spawned", {
+          memberName: args.memberName,
+          sessionId,
+          teamName: args.teamName,
+        });
         return `Member "${args.memberName}" spawned (session: ${sessionId}). Initial prompt sent.`;
       } catch (err) {
+        log.error("tool", "team_spawn failed", {
+          memberName: args.memberName,
+          teamName: args.teamName,
+          error: String(err),
+        });
         console.error("[team_spawn] error:", err);
         return `Error spawning member: ${String(err)}`;
       }
     },
   });
 
+  // ---------------------------------------------------------------------------
+  // team_message
   // ---------------------------------------------------------------------------
   // team_message
   // ---------------------------------------------------------------------------
@@ -290,9 +337,18 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
       message: z.string().describe("Message to send"),
     },
     async execute(args, context) {
+      const log = _getLogger(client, args.teamName);
+      log.debug("messaging", "team_message called", {
+        to: args.to,
+        teamName: args.teamName,
+        senderSessionId: context.sessionID,
+      });
       try {
         const team = await readTeam(args.teamName);
         if (team === null) {
+          log.warn("messaging", "team_message skipped — team not found", {
+            teamName: args.teamName,
+          });
           return `Error: Team "${args.teamName}" not found.`;
         }
 
@@ -305,9 +361,17 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
         } else {
           const member = team.members[args.to];
           if (member === undefined) {
+            log.warn("messaging", "team_message skipped — member not found", {
+              to: args.to,
+              teamName: args.teamName,
+            });
             return `Error: Member "${args.to}" not found in team "${args.teamName}".`;
           }
           if (isMemberShutdown(member)) {
+            log.warn("messaging", "team_message skipped — member shutdown", {
+              to: args.to,
+              teamName: args.teamName,
+            });
             return `Error: Member "${args.to}" is in shutdown state and cannot receive messages.`;
           }
           targetSessionId = member.sessionId;
@@ -319,8 +383,17 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           body: { parts: [{ type: "text" as const, text: prefixedMessage }] },
         });
 
+        log.info("messaging", "message sent", {
+          to: args.to,
+          teamName: args.teamName,
+        });
         return `Message sent to "${args.to}".`;
       } catch (err) {
+        log.error("messaging", "team_message failed", {
+          to: args.to,
+          teamName: args.teamName,
+          error: String(err),
+        });
         console.error("[team_message] error:", err);
         return `Error sending message: ${String(err)}`;
       }
@@ -340,9 +413,17 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
         .describe("Message to broadcast to all active members"),
     },
     async execute(args, context) {
+      const log = _getLogger(client, args.teamName);
+      log.debug("messaging", "team_broadcast called", {
+        teamName: args.teamName,
+        senderSessionId: context.sessionID,
+      });
       try {
         const team = await readTeam(args.teamName);
         if (team === null) {
+          log.warn("messaging", "team_broadcast skipped — team not found", {
+            teamName: args.teamName,
+          });
           return `Error: Team "${args.teamName}" not found.`;
         }
 
@@ -376,10 +457,21 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
         );
 
         if (messaged.length === 0) {
+          log.info("messaging", "team_broadcast — no active members", {
+            teamName: args.teamName,
+          });
           return `Broadcast sent to no members (no active members found excluding sender).`;
         }
+        log.info("messaging", "team_broadcast sent", {
+          teamName: args.teamName,
+          recipients: messaged,
+        });
         return `Broadcast sent to: ${messaged.join(", ")}.`;
       } catch (err) {
+        log.error("messaging", "team_broadcast failed", {
+          teamName: args.teamName,
+          error: String(err),
+        });
         console.error("[team_broadcast] error:", err);
         return `Error broadcasting: ${String(err)}`;
       }
@@ -396,9 +488,14 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
       teamName: z.string().describe("Name of the team"),
     },
     async execute(args, _context) {
+      const log = _getLogger(client, args.teamName);
+      log.debug("tool", "team_status called", { teamName: args.teamName });
       try {
         const team = await readTeam(args.teamName);
         if (team === null) {
+          log.warn("tool", "team_status skipped — team not found", {
+            teamName: args.teamName,
+          });
           return `Error: Team "${args.teamName}" not found.`;
         }
 
@@ -428,8 +525,17 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           `Tasks: pending=${tasksByStatus.pending ?? 0} in_progress=${tasksByStatus.in_progress ?? 0} completed=${tasksByStatus.completed ?? 0} blocked=${tasksByStatus.blocked ?? 0}`,
         ];
 
+        log.info("tool", "team_status retrieved", {
+          teamName: args.teamName,
+          memberCount: Object.keys(team.members).length,
+          taskCount: Object.keys(team.tasks).length,
+        });
         return lines.join("\n");
       } catch (err) {
+        log.error("tool", "team_status failed", {
+          teamName: args.teamName,
+          error: String(err),
+        });
         console.error("[team_status] error:", err);
         return `Error getting status: ${String(err)}`;
       }
@@ -450,9 +556,17 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
         .describe("Member to shut down. Omit to shut down all active members."),
     },
     async execute(args, _context) {
+      const log = _getLogger(client, args.teamName);
+      log.debug("tool", "team_shutdown called", {
+        teamName: args.teamName,
+        targetMember: args.memberName ?? "all",
+      });
       try {
         const team = await readTeam(args.teamName);
         if (team === null) {
+          log.warn("tool", "team_shutdown skipped — team not found", {
+            teamName: args.teamName,
+          });
           return `Error: Team "${args.teamName}" not found.`;
         }
 
@@ -464,6 +578,10 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
         if (typeof args.memberName === "string") {
           const member = team.members[args.memberName];
           if (member === undefined) {
+            log.warn("tool", "team_shutdown skipped — member not found", {
+              teamName: args.teamName,
+              memberName: args.memberName,
+            });
             return `Error: Member "${args.memberName}" not found in team "${args.teamName}".`;
           }
           targets.push({ name: args.memberName, sessionId: member.sessionId });
@@ -492,10 +610,21 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
         }
 
         if (shut.length === 0) {
+          log.info("tool", "team_shutdown — no active members to shut down", {
+            teamName: args.teamName,
+          });
           return `No members were shut down (no active members found).`;
         }
+        log.info("tool", "shutdown requested", {
+          teamName: args.teamName,
+          shutMembers: shut,
+        });
         return `Shutdown requested for: ${shut.join(", ")}.`;
       } catch (err) {
+        log.error("tool", "team_shutdown failed", {
+          teamName: args.teamName,
+          error: String(err),
+        });
         console.error("[team_shutdown] error:", err);
         return `Error shutting down: ${String(err)}`;
       }
@@ -518,17 +647,33 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
         ),
     },
     async execute(args, _context) {
+      const log = _getLogger(client, args.teamName);
+      log.debug("tool", "team_interrupt called", {
+        teamName: args.teamName,
+        memberName: args.memberName,
+      });
       try {
         const team = await readTeam(args.teamName);
         if (team === null) {
+          log.warn("tool", "team_interrupt skipped — team not found", {
+            teamName: args.teamName,
+          });
           return `Error: Team "${args.teamName}" not found.`;
         }
 
         const member = team.members[args.memberName];
         if (member === undefined) {
+          log.warn("tool", "team_interrupt skipped — member not found", {
+            teamName: args.teamName,
+            memberName: args.memberName,
+          });
           return `Error: Member "${args.memberName}" not found in team "${args.teamName}".`;
         }
         if (isMemberShutdown(member)) {
+          log.warn("tool", "team_interrupt skipped — member shutdown", {
+            teamName: args.teamName,
+            memberName: args.memberName,
+          });
           return `Error: Member "${args.memberName}" is in shutdown state and cannot be interrupted.`;
         }
 
@@ -537,6 +682,11 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           path: { id: member.sessionId },
         });
         if (abortResult.error !== undefined) {
+          log.error("tool", "team_interrupt abort failed", {
+            teamName: args.teamName,
+            memberName: args.memberName,
+            error: JSON.stringify(abortResult.error),
+          });
           return `Error: Failed to interrupt member "${args.memberName}": ${JSON.stringify(abortResult.error)}`;
         }
 
@@ -560,13 +710,28 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
             "[team_interrupt] promptAsync failed after abort:",
             promptErr,
           );
+          log.error("tool", "team_interrupt promptAsync failed after abort", {
+            teamName: args.teamName,
+            memberName: args.memberName,
+            error: String(promptErr),
+          });
           return `Member "${args.memberName}" interrupted, but failed to deliver message: ${String(promptErr)}`;
         }
 
+        log.info("tool", "member interrupted", {
+          teamName: args.teamName,
+          memberName: args.memberName,
+          wasRunning,
+        });
         return wasRunning
           ? `Member "${args.memberName}" interrupted and priority message delivered.`
           : `Member "${args.memberName}" was idle — priority message delivered without interruption.`;
       } catch (err) {
+        log.error("tool", "team_interrupt failed", {
+          teamName: args.teamName,
+          memberName: args.memberName,
+          error: String(err),
+        });
         console.error("[team_interrupt] error:", err);
         return `Error interrupting member: ${String(err)}`;
       }
@@ -592,9 +757,18 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
         .describe("Task IDs this task is blocked by (optional)"),
     },
     async execute(args, _context) {
+      const log = _getLogger(client, args.teamName);
+      log.debug("tool", "team_task_add called", {
+        teamName: args.teamName,
+        title: args.title,
+        assignee: args.assignee,
+      });
       try {
         const team = await readTeam(args.teamName);
         if (team === null) {
+          log.warn("tool", "team_task_add skipped — team not found", {
+            teamName: args.teamName,
+          });
           return `Error: Team "${args.teamName}" not found.`;
         }
         const taskId = `task_${Date.now()}`;
@@ -614,8 +788,17 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
             },
           },
         });
+        log.info("tool", "task added", {
+          teamName: args.teamName,
+          taskId,
+          title: args.title,
+        });
         return `Task "${args.title}" added with ID: ${taskId}.`;
       } catch (err) {
+        log.error("tool", "team_task_add failed", {
+          teamName: args.teamName,
+          error: String(err),
+        });
         console.error("[team_task_add] error:", err);
         return `Error adding task: ${String(err)}`;
       }
@@ -633,6 +816,12 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
       taskId: z.string().describe("ID of the task to claim"),
     },
     async execute(args, context) {
+      const log = _getLogger(client, args.teamName);
+      log.debug("tool", "team_task_claim called", {
+        teamName: args.teamName,
+        taskId: args.taskId,
+        sessionId: context.sessionID,
+      });
       try {
         const found = await findTeamBySession(context.sessionID);
         const memberName =
@@ -642,10 +831,25 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
 
         const result = await claimTask(args.teamName, args.taskId, memberName);
         if (!result.ok) {
+          log.warn("tool", "team_task_claim failed", {
+            teamName: args.teamName,
+            taskId: args.taskId,
+            reason: result.reason,
+          });
           return `Error: ${result.reason}`;
         }
+        log.info("tool", "task claimed", {
+          teamName: args.teamName,
+          taskId: args.taskId,
+          memberName,
+        });
         return `Task "${args.taskId}" claimed by "${memberName}" and is now in_progress.`;
       } catch (err) {
+        log.error("tool", "team_task_claim failed", {
+          teamName: args.teamName,
+          taskId: args.taskId,
+          error: String(err),
+        });
         console.error("[team_task_claim] error:", err);
         return `Error claiming task: ${String(err)}`;
       }
@@ -663,17 +867,37 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
       taskId: z.string().describe("ID of the task to mark as completed"),
     },
     async execute(args, _context) {
+      const log = _getLogger(client, args.teamName);
+      log.debug("tool", "team_task_done called", {
+        teamName: args.teamName,
+        taskId: args.taskId,
+      });
       try {
         const result = await completeTask(args.teamName, args.taskId);
         if (!result.ok) {
+          log.warn("tool", "team_task_done failed", {
+            teamName: args.teamName,
+            taskId: args.taskId,
+            reason: result.reason,
+          });
           return `Error: ${result.reason}`;
         }
         const unblockedMsg =
           result.unblockedTaskIds.length > 0
             ? ` Newly unblocked: ${result.unblockedTaskIds.join(", ")}.`
             : "";
+        log.info("tool", "task completed", {
+          teamName: args.teamName,
+          taskId: args.taskId,
+          unblocked: result.unblockedTaskIds,
+        });
         return `Task "${args.taskId}" marked as completed.${unblockedMsg}`;
       } catch (err) {
+        log.error("tool", "team_task_done failed", {
+          teamName: args.teamName,
+          taskId: args.taskId,
+          error: String(err),
+        });
         console.error("[team_task_done] error:", err);
         return `Error completing task: ${String(err)}`;
       }
@@ -708,9 +932,18 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
         .describe("Member names to @mention in this message"),
     },
     async execute(args, context) {
+      const log = _getLogger(client, args.teamName);
+      log.debug("messaging", "team_post called", {
+        teamName: args.teamName,
+        senderSessionId: context.sessionID,
+        hasMentions: args.mentions !== undefined,
+      });
       try {
         const team = await readTeam(args.teamName);
         if (team === null) {
+          log.warn("messaging", "team_post skipped — team not found", {
+            teamName: args.teamName,
+          });
           return `Error: Team "${args.teamName}" not found.`;
         }
 
@@ -761,8 +994,17 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           }),
         );
 
+        log.info("messaging", "posted to channel", {
+          teamName: args.teamName,
+          eventId: event.id,
+          mentions: validatedMentions,
+        });
         return `Posted to channel: ${event.id}`;
       } catch (err) {
+        log.error("messaging", "team_post failed", {
+          teamName: args.teamName,
+          error: String(err),
+        });
         console.error("[team_post] error:", err);
         return `Error posting message: ${String(err)}`;
       }
@@ -783,6 +1025,11 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
         .describe("Number of recent messages to retrieve (default: 50)"),
     },
     async execute(args, _context) {
+      const log = _getLogger(client, args.teamName);
+      log.debug("tool", "team_history called", {
+        teamName: args.teamName,
+        limit: args.limit,
+      });
       try {
         const team = await readTeam(args.teamName);
         if (team === null) {
@@ -816,9 +1063,17 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
       message: z.string().describe("Message to announce to all members"),
     },
     async execute(args, context) {
+      const log = _getLogger(client, args.teamName);
+      log.debug("messaging", "team_announce called", {
+        teamName: args.teamName,
+        senderSessionId: context.sessionID,
+      });
       try {
         const team = await readTeam(args.teamName);
         if (team === null) {
+          log.warn("messaging", "team_announce skipped — team not found", {
+            teamName: args.teamName,
+          });
           return `Error: Team "${args.teamName}" not found.`;
         }
 
@@ -858,8 +1113,16 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           }),
         );
 
+        log.info("messaging", "announcement sent", {
+          teamName: args.teamName,
+          recipients: messaged,
+        });
         return `Announcement sent to: ${messaged.join(", ")} (including sender).`;
       } catch (err) {
+        log.error("messaging", "team_announce failed", {
+          teamName: args.teamName,
+          error: String(err),
+        });
         console.error("[team_announce] error:", err);
         return `Error sending announcement: ${String(err)}`;
       }
@@ -881,13 +1144,26 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
         ),
     },
     async execute(args, context) {
+      const log = _getLogger(client, args.teamName);
+      log.debug("tool", "team_react called", {
+        teamName: args.teamName,
+        messageId: args.messageId,
+        reaction: args.reaction,
+      });
       try {
         if (!isValidReaction(args.reaction)) {
+          log.warn("tool", "team_react skipped — invalid reaction", {
+            teamName: args.teamName,
+            reaction: args.reaction,
+          });
           return `Error: Invalid reaction "${args.reaction}". Valid: ${VALID_REACTIONS.join(", ")}`;
         }
 
         const team = await readTeam(args.teamName);
         if (team === null) {
+          log.warn("tool", "team_react skipped — team not found", {
+            teamName: args.teamName,
+          });
           return `Error: Team "${args.teamName}" not found.`;
         }
 
@@ -903,8 +1179,17 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           reaction: args.reaction,
         });
 
+        log.info("tool", "reaction added", {
+          teamName: args.teamName,
+          messageId: args.messageId,
+          reaction: args.reaction,
+        });
         return `Reaction ${args.reaction} added to ${args.messageId}: ${event.id}`;
       } catch (err) {
+        log.error("tool", "team_react failed", {
+          teamName: args.teamName,
+          error: String(err),
+        });
         console.error("[team_react] error:", err);
         return `Error adding reaction: ${String(err)}`;
       }
@@ -926,9 +1211,17 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
         .describe("Number of recent events to keep (default: 1000)"),
     },
     async execute(args, _context) {
+      const log = _getLogger(client, args.teamName);
+      log.debug("tool", "team_prune called", {
+        teamName: args.teamName,
+        keep: args.keep,
+      });
       try {
         const team = await readTeam(args.teamName);
         if (team === null) {
+          log.warn("tool", "team_prune skipped — team not found", {
+            teamName: args.teamName,
+          });
           return `Error: Team "${args.teamName}" not found.`;
         }
 
@@ -936,8 +1229,17 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           args.teamName,
           args.keep,
         );
+        log.info("tool", "events pruned", {
+          teamName: args.teamName,
+          pruned,
+          remaining,
+        });
         return `Pruned ${pruned} events. ${remaining} events remaining.`;
       } catch (err) {
+        log.error("tool", "team_prune failed", {
+          teamName: args.teamName,
+          error: String(err),
+        });
         console.error("[team_prune] error:", err);
         return `Error pruning events: ${String(err)}`;
       }
@@ -1024,6 +1326,11 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
         .describe("Filter tasks by status"),
     },
     async execute(args, _context) {
+      const log = _getLogger(client, args.teamName);
+      log.debug("tool", "team_task_list called", {
+        teamName: args.teamName,
+        status: args.status,
+      });
       try {
         const team = await readTeam(args.teamName);
         if (team === null) {
@@ -1073,14 +1380,26 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
         .describe("New assignee for the task (use null to unassign)"),
     },
     async execute(args, _context) {
+      const log = _getLogger(client, args.teamName);
+      log.debug("tool", "team_task_update called", {
+        teamName: args.teamName,
+        taskId: args.taskId,
+      });
       try {
         const team = await readTeam(args.teamName);
         if (team === null) {
+          log.warn("tool", "team_task_update skipped — team not found", {
+            teamName: args.teamName,
+          });
           return `Error: Team "${args.teamName}" not found.`;
         }
 
         const task = team.tasks[args.taskId];
         if (task === undefined) {
+          log.warn("tool", "team_task_update skipped — task not found", {
+            teamName: args.teamName,
+            taskId: args.taskId,
+          });
           return `Error: Task "${args.taskId}" not found in team "${args.teamName}".`;
         }
 
@@ -1089,6 +1408,10 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           args.description === undefined &&
           args.assignee === undefined
         ) {
+          log.warn("tool", "team_task_update skipped — no fields to update", {
+            teamName: args.teamName,
+            taskId: args.taskId,
+          });
           return `Error: No fields to update. Provide at least one of: title, description, assignee.`;
         }
 
@@ -1109,8 +1432,17 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           },
         });
 
+        log.info("tool", "task updated", {
+          teamName: args.teamName,
+          taskId: args.taskId,
+        });
         return `Task "${args.taskId}" updated.`;
       } catch (err) {
+        log.error("tool", "team_task_update failed", {
+          teamName: args.teamName,
+          taskId: args.taskId,
+          error: String(err),
+        });
         console.error("[team_task_update] error:", err);
         return `Error updating task: ${String(err)}`;
       }
@@ -1127,6 +1459,11 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
       memberName: z.string().describe("Name of the member to get info about"),
     },
     async execute(args, _context) {
+      const log = _getLogger(client, args.teamName);
+      log.debug("tool", "team_member_info called", {
+        teamName: args.teamName,
+        memberName: args.memberName,
+      });
       try {
         const team = await readTeam(args.teamName);
         if (team === null) {
@@ -1161,6 +1498,74 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
     },
   });
 
+  // ---------------------------------------------------------------------------
+  // team_logs
+  // ---------------------------------------------------------------------------
+  const team_logs = tool({
+    description:
+      "Read recent debug log entries for a team. Logs are written to a debug.jsonl file when structured logging is enabled for the team.",
+    args: {
+      teamName: z.string().describe("Name of the team"),
+      level: z
+        .enum(["debug", "info", "warn", "error"])
+        .optional()
+        .describe("Filter by log level"),
+      sessionId: z.string().optional().describe("Filter by session ID"),
+      memberName: z.string().optional().describe("Filter by member name"),
+      since: z
+        .string()
+        .optional()
+        .describe("ISO timestamp — only logs after this time"),
+      limit: z
+        .number()
+        .optional()
+        .default(100)
+        .describe("Maximum number of log entries to return (default: 100)"),
+    },
+    async execute(args, _context) {
+      const log = _getLogger(client, args.teamName);
+      log.debug("tool", "team_logs called", {
+        teamName: args.teamName,
+        level: args.level,
+        limit: args.limit,
+      });
+      try {
+        const team = await readTeam(args.teamName);
+        if (team === null) {
+          return `Error: Team "${args.teamName}" not found.`;
+        }
+
+        const { logs, total } = await readDebugLogs(args.teamName, {
+          ...(args.level !== undefined ? { level: args.level } : {}),
+          ...(args.sessionId !== undefined
+            ? { sessionId: args.sessionId }
+            : {}),
+          ...(args.memberName !== undefined
+            ? { memberName: args.memberName }
+            : {}),
+          ...(args.since !== undefined ? { since: args.since } : {}),
+          limit: args.limit,
+        });
+
+        if (logs.length === 0) {
+          return `No debug logs found for team "${args.teamName}" matching the given filters.`;
+        }
+
+        const lines = [
+          `Debug logs for "${args.teamName}" (${logs.length} of ${total} total):`,
+          ...logs.map(
+            (e) =>
+              `[${e.ts}] ${e.level.toUpperCase()} [${e.category}] ${e.memberName ?? "-"}: ${e.message}${e.context !== undefined ? ` ${JSON.stringify(e.context)}` : ""}`,
+          ),
+        ];
+        return lines.join("\n");
+      } catch (err) {
+        console.error("[team_logs] error:", err);
+        return `Error reading debug logs: ${String(err)}`;
+      }
+    },
+  });
+
   return {
     team_create,
     team_spawn,
@@ -1182,6 +1587,7 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
     team_task_list,
     team_task_update,
     team_member_info,
+    team_logs,
   };
 }
 
@@ -1189,6 +1595,19 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
 // Factory — call this at plugin init with the live client
 // ---------------------------------------------------------------------------
 
-export function createTools(client: Client): Record<string, ToolDefinition> {
-  return makeTools(client);
+const noOpLogger = {
+  debug: (_c: string, _m: string, _x?: Record<string, unknown>) => {},
+  info: (_c: string, _m: string, _x?: Record<string, unknown>) => {},
+  warn: (_c: string, _m: string, _x?: Record<string, unknown>) => {},
+  error: (_c: string, _m: string, _x?: Record<string, unknown>) => {},
+};
+
+export function createTools(
+  client: Client,
+  getLogger?: (client: Client, teamName: string) => Logger,
+): Record<string, ToolDefinition> {
+  return makeTools(
+    client,
+    getLogger ?? (() => noOpLogger as unknown as Logger),
+  );
 }

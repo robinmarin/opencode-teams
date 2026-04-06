@@ -427,6 +427,10 @@ function eventsFilePath(teamName: string): string {
   return path.join(teamDir(teamName), "events.jsonl");
 }
 
+function debugLogFilePath(teamName: string): string {
+  return path.join(teamDir(teamName), "logs", "debug.jsonl");
+}
+
 // ---------------------------------------------------------------------------
 // Event write coalescing — batches rapid appendEvent calls into a single
 // fs.appendFile per team, controlled by a debounce timer.
@@ -511,6 +515,67 @@ export async function getEvents(
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
       return { events: [], offset: 0 };
+    }
+    throw err;
+  }
+}
+
+export type DebugLogFilter = {
+  level?: string;
+  sessionId?: string;
+  memberName?: string;
+  since?: string;
+  limit?: number;
+};
+
+export type DebugLogEntry = {
+  id: string;
+  ts: string;
+  level: string;
+  category: string;
+  sessionId: string | null;
+  teamName: string | null;
+  memberName: string | null;
+  correlationId: string | null;
+  message: string;
+  context?: Record<string, unknown>;
+};
+
+export async function readDebugLogs(
+  teamName: string,
+  filter: DebugLogFilter = {},
+): Promise<{ logs: DebugLogEntry[]; total: number }> {
+  const logPath = debugLogFilePath(teamName);
+  try {
+    const content = await fs.readFile(logPath, "utf-8");
+    const lines = content.split("\n").filter((l) => l.trim() !== "");
+    const total = lines.length;
+
+    const parsed = lines.map((l) => JSON.parse(l) as DebugLogEntry);
+
+    let filtered = parsed;
+
+    if (filter.level) {
+      filtered = filtered.filter((e) => e.level === filter.level);
+    }
+    if (filter.sessionId) {
+      filtered = filtered.filter((e) => e.sessionId === filter.sessionId);
+    }
+    if (filter.memberName) {
+      filtered = filtered.filter((e) => e.memberName === filter.memberName);
+    }
+    if (filter.since) {
+      const sinceMs = new Date(filter.since).getTime();
+      filtered = filtered.filter((e) => new Date(e.ts).getTime() >= sinceMs);
+    }
+
+    const limit = filter.limit ?? 100;
+    const selected = filtered.slice(-limit);
+
+    return { logs: selected, total };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return { logs: [], total: 0 };
     }
     throw err;
   }

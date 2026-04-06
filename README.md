@@ -21,6 +21,7 @@ An [OpenCode](https://opencode.ai) plugin that adds agent teams — spawn, coord
 | `team_announce` | Broadcast a message to all active members including the sender. |
 | `team_react` | Add a reaction to a channel message. |
 | `team_prune` | Compact the events log, keeping only the most recent N entries. |
+| `team_logs` | Read and filter debug log entries for a team. |
 
 ## How it works
 
@@ -38,7 +39,7 @@ Add to `~/.config/opencode/opencode.json`:
 }
 ```
 
-Restart OpenCode. The 15 team tools will be available in your session.
+Restart OpenCode. The 16 team tools will be available in your session.
 
 ## Local Development
 
@@ -127,6 +128,44 @@ Member statuses: `ready | busy | shutdown_requested | shutdown | error`
 **Command:** `team.status.toggle` (keybind `ctrl+t`) — show/hide the sidebar panel.
 
 State is read directly from `~/.config/opencode/teams/*/config.json` via `fs.watch`; the panel updates immediately on any file change or `session.idle` / `session.status` event.
+
+---
+
+## Debuggable Logs
+
+Every tool call is automatically logged with structured entries. Logs are written to:
+
+```
+~/.config/opencode/teams/<teamName>/logs/debug.jsonl
+```
+
+**Log entry schema:**
+```json
+{
+  "id": "log_<timestamp>_<random>",
+  "ts": "2026-04-06T10:00:00.000Z",
+  "level": "debug | info | warn | error",
+  "category": "tool | messaging | state | sdk | plugin",
+  "sessionId": "sess_xxx",
+  "teamName": "my-team",
+  "memberName": "alice | null",
+  "correlationId": null,
+  "message": "human-readable description",
+  "context": { /* additional metadata */ }
+}
+```
+
+**What gets logged:**
+- Every tool call → `debug` entry with args
+- Every success → `info` entry with result metadata
+- Every failure → `error` entry with error details
+
+**Query logs:**
+```
+team_logs --team <name> [--level debug|info|warn|error] [--session <id>] [--member <name>] [--since <iso>] [--limit 100]
+```
+
+Logs are written with a 100ms debounce to minimize disk I/O. A ring buffer (1000 entries) holds the most recent entries in memory for sub-millisecond retrieval.
 
 ---
 
