@@ -1,12 +1,12 @@
 /** @jsxImportSource @opentui/solid */
 
-import type { TuiPlugin, TuiThemeCurrent } from "@opencode-ai/plugin/tui";
-import { createSignal } from "solid-js";
 import * as fs from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
-import * as path from "node:path";
 import * as os from "node:os";
-import type { TeamConfig, TeamMember, MemberStatus } from "./state.js";
+import * as path from "node:path";
+import type { TuiPlugin, TuiThemeCurrent } from "@opencode-ai/plugin/tui";
+import { createSignal } from "solid-js";
+import type { MemberStatus, TeamConfig, TeamMember } from "./state.js";
 
 // ---------------------------------------------------------------------------
 // Disk helpers
@@ -78,7 +78,9 @@ function TeamPanel(props: { team: TeamConfig; theme: TuiThemeCurrent }) {
       {tasks.length > 0 && (
         <box flexDirection="column">
           <text fg={props.theme.border}>{sep}</text>
-          <text fg={props.theme.textMuted}>{` Tasks: ${doneCount}/${tasks.length} done`}</text>
+          <text
+            fg={props.theme.textMuted}
+          >{` Tasks: ${doneCount}/${tasks.length} done`}</text>
         </box>
       )}
     </box>
@@ -105,8 +107,7 @@ export const tui: TuiPlugin = async (api) => {
   const [teams, setTeams] = createSignal<TeamConfig[]>([]);
   const [visible, setVisible] = createSignal(true);
 
-  const reload = () =>
-    void loadAllTeams(teamsDir).then((t) => setTeams(t));
+  const reload = () => void loadAllTeams(teamsDir).then((t) => setTeams(t));
 
   // Initial load
   reload();
