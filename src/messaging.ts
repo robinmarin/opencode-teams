@@ -17,6 +17,19 @@ import {
 // leadSessionId_memberName -> last notification timestamp (ms)
 const lastNotified = new Map<string, number>();
 
+// Per-session promise chain — serialises concurrent events for the same session
+// so that a session.status(busy) arriving at the same ms as session.idle never
+// clobbers the "ready" state written by the idle handler.
+const sessionQueues = new Map<string, Promise<void>>();
+
+function withSessionQueue(sessionId: string, fn: () => Promise<void>): void {
+  const current = sessionQueues.get(sessionId) ?? Promise.resolve();
+  const next = current.then(fn).catch(() => {
+    // errors are already caught and logged inside fn
+  });
+  sessionQueues.set(sessionId, next);
+}
+
 type Client = PluginInput["client"];
 
 /**
@@ -84,6 +97,20 @@ export function createEventHandler(
     console.debug(
       `[opencode-teams] event=${event.type} sessionID=${sessionID} indexSize=${indexSize}`,
     );
+
+    // Serialise all events for the same session through a per-session queue.
+    // This prevents concurrent session.status(busy) and session.idle events
+    // from racing each other and clobbering the "ready" status on disk.
+    withSessionQueue(sessionID, () => handleEvent(client, getLogger, event, sessionID));
+  };
+}
+
+async function handleEvent(
+  client: Client,
+  getLogger: GetLogger,
+  event: Event,
+  sessionID: string,
+): Promise<void> {
 
     let found: Awaited<ReturnType<typeof findTeamBySession>>;
     try {
@@ -352,6 +379,17 @@ export function createEventHandler(
       }
     }
 
+    // Only notify the lead when the member was actually busy before going idle.
+    // If the member was already ready (e.g. a duplicate session.idle event fired
+    // while a concurrent handler already processed it), skip — the lead was
+    // already notified by the first handler and there is nothing new to report.
+    if (!wasBusy) {
+      log.debug("messaging", "skipping lead notification — member was not busy", {
+        memberName,
+      });
+      return;
+    }
+
     // Send a plain-text team status summary to the lead.
     // Plain text (no ANSI escapes) so the model receives clean, readable context.
     log.debug("messaging", "sending team status to lead via promptAsync", {
@@ -386,5 +424,4 @@ export function createEventHandler(
         error: String(err),
       });
     }
-  };
 }

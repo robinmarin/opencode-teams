@@ -235,10 +235,10 @@ function makeTools(
 
         const systemPrompt = [
           `You are "${args.memberName}", a ${args.role} on team "${args.teamName}".`,
-          `Your lead session ID is: ${team.leadSessionId}.`,
           `You were spawned to work on specific tasks. Complete them thoroughly.`,
-          `IMPORTANT: You must NOT use team management tools (team_create, team_spawn, team_message, team_broadcast, team_status, team_shutdown). These tools are reserved for the team lead only.`,
-          `When you complete a task, summarize your results clearly so the lead can review them.`,
+          `IMPORTANT: You must NOT use team management tools (team_create, team_spawn, team_status, team_shutdown, team_spawn). These are reserved for the team lead only.`,
+          `When you complete your task, send your results to the lead using: team_message with to="lead", teamName="${args.teamName}".`,
+          `You may also use team_post to broadcast updates to the whole team channel.`,
         ].join("\n");
 
         let modelOpt: { providerID: string; modelID: string } | undefined;
@@ -356,7 +356,7 @@ function makeTools(
 
         // Resolve target session ID
         let targetSessionId: string;
-        if (args.to === "lead") {
+        if (args.to === "lead" || args.to === LEAD_MEMBER_NAME) {
           targetSessionId = team.leadSessionId;
         } else {
           const member = team.members[args.to];
