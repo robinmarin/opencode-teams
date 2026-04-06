@@ -9,6 +9,7 @@ import * as path from "node:path";
 export type MemberStatus =
   | "ready"
   | "busy"
+  | "retrying"
   | "shutdown_requested"
   | "shutdown"
   | "error";
@@ -20,6 +21,9 @@ export type TeamMember = {
   agentType: string;
   model: string;
   spawnedAt: string; // ISO timestamp
+  // Populated when status === "retrying"; cleared on any other status transition.
+  retryAttempt?: number;
+  retryNextMs?: number; // ms until the SDK fires the next attempt
 };
 
 export type TeamTask = {
@@ -62,6 +66,38 @@ export type ChannelEvent = {
 export const MAX_EVENTS_LINES = 1000;
 
 // ---------------------------------------------------------------------------
+// Member predicates and constants
+// ---------------------------------------------------------------------------
+
+/** Sentinel member name used to identify the team lead in the session index. */
+export const LEAD_MEMBER_NAME = "__lead__";
+
+/** True when a member can receive messages and perform work. */
+export function isMemberActive(member: TeamMember): boolean {
+  return (
+    member.status === "ready" ||
+    member.status === "busy" ||
+    member.status === "retrying"
+  );
+}
+
+/** True when a member is in a terminal shutdown state and cannot receive messages. */
+export function isMemberShutdown(member: TeamMember): boolean {
+  return member.status === "shutdown" || member.status === "shutdown_requested";
+}
+
+/**
+ * Resolves the display name for the session making a tool call.
+ * Falls back to the raw sessionID if the session is not part of any team.
+ * Never returns "unknown" — the sessionID is always a meaningful fallback
+ * for debugging event logs.
+ */
+export async function resolveSenderName(sessionID: string): Promise<string> {
+  const info = await findTeamBySession(sessionID);
+  return info !== null ? info.memberName : sessionID;
+}
+
+// ---------------------------------------------------------------------------
 // Paths
 // ---------------------------------------------------------------------------
 
@@ -73,6 +109,8 @@ export function setTestTeamsDir(dir: string | undefined): void {
   _overrideTeamsDir = dir;
   // Clear the reverse index so tests start clean
   sessionIndex.clear();
+  // Disable write coalescing in tests so reads see writes immediately
+  _eventDebounceMs = dir !== undefined ? 0 : 100;
 }
 
 function teamsDir(): string {
@@ -116,6 +154,20 @@ const sessionIndex = new Map<
   { teamName: string; memberName: string }
 >();
 
+/**
+ * Returns true if the given sessionId is present in the in-memory index.
+ * Use as a fast pre-check before calling findTeamBySession: if the index is
+ * non-empty and the session is absent, it is definitely not a team session.
+ */
+export function isKnownSession(sessionId: string): boolean {
+  return sessionIndex.has(sessionId);
+}
+
+/** Returns the current number of entries in the session index. */
+export function sessionIndexSize(): number {
+  return sessionIndex.size;
+}
+
 function indexTeam(config: TeamConfig): void {
   // Remove any stale entries for this team before re-indexing
   for (const [sessionId, entry] of sessionIndex) {
@@ -123,7 +175,7 @@ function indexTeam(config: TeamConfig): void {
   }
   sessionIndex.set(config.leadSessionId, {
     teamName: config.name,
-    memberName: "__lead__",
+    memberName: LEAD_MEMBER_NAME,
   });
   for (const [memberName, member] of Object.entries(config.members)) {
     sessionIndex.set(member.sessionId, { teamName: config.name, memberName });
@@ -161,6 +213,7 @@ export async function updateMember(
   teamName: string,
   memberName: string,
   patch: Partial<TeamMember>,
+  clear?: (keyof TeamMember)[],
 ): Promise<void> {
   return withLock(teamName, async () => {
     const configPath = teamConfigPath(teamName);
@@ -170,7 +223,9 @@ export async function updateMember(
     if (existing === undefined) {
       throw new Error(`Member "${memberName}" not found in team "${teamName}"`);
     }
-    config.members[memberName] = { ...existing, ...patch };
+    const merged = { ...existing, ...patch } as TeamMember;
+    for (const key of clear ?? []) delete merged[key];
+    config.members[memberName] = merged;
     const tmpPath = `${configPath}.tmp`;
     await fs.writeFile(tmpPath, JSON.stringify(config, null, 2), "utf-8");
     await fs.rename(tmpPath, configPath);
@@ -207,7 +262,7 @@ export async function findTeamBySession(
     indexTeam(team);
 
     if (team.leadSessionId === sessionId)
-      return { team, memberName: "__lead__" };
+      return { team, memberName: LEAD_MEMBER_NAME };
     for (const [memberName, member] of Object.entries(team.members)) {
       if (member.sessionId === sessionId) return { team, memberName };
     }
@@ -333,7 +388,11 @@ export async function markStaleMembersAsError(
     }> = [];
     let dirty = false;
     for (const [name, member] of Object.entries(config.members)) {
-      if (member.status === "busy" || member.status === "shutdown_requested") {
+      if (
+        member.status === "busy" ||
+        member.status === "retrying" ||
+        member.status === "shutdown_requested"
+      ) {
         recovered.push({ memberName: name, previousStatus: member.status });
         config.members[name] = { ...member, status: "error" };
         dirty = true;
@@ -354,6 +413,29 @@ function eventsFilePath(teamName: string): string {
   return path.join(teamDir(teamName), "events.jsonl");
 }
 
+// ---------------------------------------------------------------------------
+// Event write coalescing — batches rapid appendEvent calls into a single
+// fs.appendFile per team, controlled by a debounce timer.
+// In test mode (_eventDebounceMs === 0) writes are immediate and synchronous.
+// ---------------------------------------------------------------------------
+
+let _eventDebounceMs = 100;
+const _eventBuffer = new Map<string, string[]>();
+const _eventTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+async function flushEventBuffer(teamName: string): Promise<void> {
+  const lines = _eventBuffer.get(teamName);
+  if (!lines || lines.length === 0) return;
+  _eventBuffer.delete(teamName);
+
+  const eventsPath = eventsFilePath(teamName);
+  await withLock(teamName, async () => {
+    const dir = teamDir(teamName);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.appendFile(eventsPath, lines.join(""), "utf-8");
+  });
+}
+
 export async function appendEvent(
   teamName: string,
   event: Omit<ChannelEvent, "id" | "timestamp">,
@@ -365,13 +447,36 @@ export async function appendEvent(
   };
   const line = `${JSON.stringify(fullEvent)}\n`;
 
-  const eventsPath = eventsFilePath(teamName);
+  if (_eventDebounceMs === 0) {
+    // No debounce (test mode): write immediately
+    const eventsPath = eventsFilePath(teamName);
+    await withLock(teamName, async () => {
+      const dir = teamDir(teamName);
+      await fs.mkdir(dir, { recursive: true });
+      await fs.appendFile(eventsPath, line, "utf-8");
+    });
+    return fullEvent;
+  }
 
-  await withLock(teamName, async () => {
-    const dir = teamDir(teamName);
-    await fs.mkdir(dir, { recursive: true });
-    await fs.appendFile(eventsPath, line, "utf-8");
-  });
+  // Buffer the line and (re)start the debounce timer
+  const existing = _eventBuffer.get(teamName) ?? [];
+  existing.push(line);
+  _eventBuffer.set(teamName, existing);
+
+  const existingTimer = _eventTimers.get(teamName);
+  if (existingTimer !== undefined) clearTimeout(existingTimer);
+  _eventTimers.set(
+    teamName,
+    setTimeout(() => {
+      _eventTimers.delete(teamName);
+      flushEventBuffer(teamName).catch((err) => {
+        console.error(
+          `[opencode-teams] Failed to flush event buffer for team "${teamName}":`,
+          err,
+        );
+      });
+    }, _eventDebounceMs),
+  );
 
   return fullEvent;
 }

@@ -1,11 +1,15 @@
 import type { PluginInput } from "@opencode-ai/plugin";
 import type { Event } from "@opencode-ai/sdk";
-import { ansi, renderTeamStatus } from "./renderer.js";
+import { renderTeamStatusPlain } from "./renderer.js";
+import type { TeamConfig } from "./state.js";
 import {
   appendEvent,
   findTeamBySession,
+  isKnownSession,
+  LEAD_MEMBER_NAME,
   listTeams,
   markStaleMembersAsError,
+  sessionIndexSize,
   updateMember,
 } from "./state.js";
 
@@ -21,32 +25,38 @@ type Client = PluginInput["client"];
  */
 async function recoverStaleMembers(): Promise<void> {
   const teamNames = await listTeams();
-  for (const teamName of teamNames) {
-    try {
-      const recovered = await markStaleMembersAsError(teamName);
-      for (const { memberName, previousStatus } of recovered) {
-        console.log(
-          `[opencode-teams] Recovery: member ${memberName} in team ${teamName} was stale (${previousStatus}), marked as error`,
+  // Teams have independent locks — recover them in parallel
+  await Promise.all(
+    teamNames.map(async (teamName) => {
+      try {
+        const recovered = await markStaleMembersAsError(teamName);
+        for (const { memberName, previousStatus } of recovered) {
+          console.log(
+            `[opencode-teams] Recovery: member ${memberName} in team ${teamName} was stale (${previousStatus}), marked as error`,
+          );
+        }
+      } catch (err) {
+        console.error(
+          `[opencode-teams] Recovery: failed to recover team ${teamName}:`,
+          err,
         );
       }
-    } catch (err) {
-      console.error(
-        `[opencode-teams] Recovery: failed to recover team ${teamName}:`,
-        err,
-      );
-    }
-  }
+    }),
+  );
 }
 
 /**
  * Creates an event handler to be registered as the `event` hook in the plugin's
  * returned Hooks object.
  *
- * On every `session.idle` event:
- * - If the session is not part of any team → ignore
- * - If the session is the team lead → log if any members are busy (no auto-prompt)
- * - If the session is a team member going idle → update status to "ready";
- *   if they were previously "busy", notify the lead
+ * Handled events:
+ * - `session.status` (busy | retrying | idle):
+ *     busy     → member status = "busy"  (silent, no lead notification)
+ *     retrying → member status = "retrying", stores attempt + next-retry delay
+ *     idle     → ignored (session.idle fires separately and is handled below)
+ * - `session.idle`:
+ *     Lead going idle   → no action (anti-loop guard)
+ *     Member going idle → status = "ready"; if was busy/retrying, notify lead
  */
 export function createEventHandler(
   client: Client,
@@ -57,9 +67,14 @@ export function createEventHandler(
   });
 
   return async ({ event }) => {
-    if (event.type !== "session.idle") return;
+    if (event.type !== "session.idle" && event.type !== "session.status")
+      return;
 
     const { sessionID } = event.properties;
+
+    // Fast pre-check: if the index is populated and this session is absent,
+    // it is definitely not a team session — skip the disk scan entirely.
+    if (sessionIndexSize() > 0 && !isKnownSession(sessionID)) return;
 
     let found: Awaited<ReturnType<typeof findTeamBySession>>;
     try {
@@ -73,20 +88,59 @@ export function createEventHandler(
 
     const { team, memberName } = found;
 
-    // Lead going idle — no action needed
-    if (memberName === "__lead__") {
-      return;
-    }
+    // Lead session — no action needed for either event type
+    if (memberName === LEAD_MEMBER_NAME) return;
 
-    // Team member going idle
     const member = team.members[memberName];
     if (member === undefined) return;
 
-    const wasBusy = member.status === "busy";
+    // -----------------------------------------------------------------------
+    // session.status — update member status silently; no lead notification.
+    // Idle transitions are handled by session.idle below.
+    // -----------------------------------------------------------------------
+    if (event.type === "session.status") {
+      const { status } = event.properties;
+      if (status.type === "idle") return; // let session.idle handle it
 
-    // Update member status to ready
+      // SDK uses "retry"; our MemberStatus uses "retrying"
+      const newStatus =
+        status.type === "retry" ? ("retrying" as const) : ("busy" as const);
+      const patch: Partial<typeof member> =
+        status.type === "retry"
+          ? {
+              status: newStatus,
+              retryAttempt: status.attempt,
+              retryNextMs: status.next,
+            }
+          : { status: newStatus };
+      // Clear stale retry context when transitioning to busy
+      const clearFields =
+        status.type !== "retry"
+          ? (["retryAttempt", "retryNextMs"] as (keyof typeof member)[])
+          : undefined;
+
+      try {
+        await updateMember(team.name, memberName, patch, clearFields);
+      } catch (err) {
+        console.error(
+          `[opencode-teams] Failed to update member ${memberName} status to ${newStatus}:`,
+          err,
+        );
+      }
+      return;
+    }
+
+    // -----------------------------------------------------------------------
+    // session.idle
+    // -----------------------------------------------------------------------
+    const wasBusy = member.status === "busy" || member.status === "retrying";
+
+    // Update member status to ready; clear any retry context
     try {
-      await updateMember(team.name, memberName, { status: "ready" });
+      await updateMember(team.name, memberName, { status: "ready" }, [
+        "retryAttempt",
+        "retryNextMs",
+      ]);
     } catch (err) {
       console.error(
         `[opencode-teams] Failed to update member ${memberName} status to ready:`,
@@ -95,37 +149,81 @@ export function createEventHandler(
       return;
     }
 
-    // If they were busy, post status to system channel (with cooldown)
-    if (wasBusy) {
-      const cooldownKey = `${team.name}_${memberName}`;
-      const lastTime = lastNotified.get(cooldownKey) ?? 0;
-      if (Date.now() - lastTime < 30_000) return;
-      lastNotified.set(cooldownKey, Date.now());
+    // Build an up-to-date team snapshot for the render (the object returned by
+    // findTeamBySession predates the updateMember call above — apply the patch
+    // in-memory so the lead sees the correct "ready" state).
+    // Build snapshot with retry context stripped and status set to ready.
+    const { retryAttempt: _ra, retryNextMs: _rnm, ...memberBase } = member;
+    const updatedTeam: TeamConfig = {
+      ...team,
+      members: {
+        ...team.members,
+        [memberName]: { ...memberBase, status: "ready" as const },
+      },
+    };
 
-      try {
-        await appendEvent(team.name, {
-          type: "status",
-          sender: memberName,
-          senderId: member.sessionId,
-          content: `${memberName} is now ready`,
-        });
-      } catch (err) {
-        console.error(
-          `[opencode-teams] Failed to post status event for ${memberName}:`,
-          err,
-        );
+    // If they were busy, post a status event to the channel (with cooldown).
+    // The render fires regardless of cooldown so the lead always gets a status
+    // update — only the channel event is rate-limited.
+    if (wasBusy) {
+      // Use \x00 as separator to prevent key collisions between team names and
+      // member names that contain underscores.
+      const cooldownKey = `${team.name}\x00${memberName}`;
+      const lastTime = lastNotified.get(cooldownKey) ?? 0;
+      const elapsed = Date.now() - lastTime;
+      const COOLDOWN_MS = 5_000;
+
+      if (elapsed < COOLDOWN_MS) {
+        // Queue the channel event; the render below still fires immediately.
+        const delay = COOLDOWN_MS - elapsed;
+        setTimeout(() => {
+          lastNotified.set(cooldownKey, Date.now());
+          appendEvent(team.name, {
+            type: "status",
+            sender: memberName,
+            senderId: member.sessionId,
+            content: `${memberName} is now ready`,
+          }).catch((err) => {
+            console.error(
+              `[opencode-teams] Failed to post queued status event for ${memberName}:`,
+              err,
+            );
+          });
+        }, delay);
+      } else {
+        lastNotified.set(cooldownKey, Date.now());
+        try {
+          await appendEvent(team.name, {
+            type: "status",
+            sender: memberName,
+            senderId: member.sessionId,
+            content: `${memberName} is now ready`,
+          });
+        } catch (err) {
+          console.error(
+            `[opencode-teams] Failed to post status event for ${memberName}:`,
+            err,
+          );
+        }
       }
     }
 
-    // Render team status meters for the lead
+    // Send a plain-text team status summary to the lead.
+    // Plain text (no ANSI escapes) so the model receives clean, readable context.
     try {
-      const leadMsg = ansi.save() + renderTeamStatus(team) + ansi.restore();
       await client.session.promptAsync({
         path: { id: team.leadSessionId },
         body: {
-          parts: [{ type: "text" as const, text: leadMsg }],
+          parts: [
+            { type: "text" as const, text: renderTeamStatusPlain(updatedTeam) },
+          ],
         },
       });
-    } catch {}
+    } catch (err) {
+      console.error(
+        `[opencode-teams] Failed to send team status to lead ${team.leadSessionId}:`,
+        err,
+      );
+    }
   };
 }

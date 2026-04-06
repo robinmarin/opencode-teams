@@ -6,8 +6,12 @@ import {
   completeTask,
   findTeamBySession,
   getEvents,
+  isMemberActive,
+  isMemberShutdown,
+  LEAD_MEMBER_NAME,
   pruneEvents,
   readTeam,
+  resolveSenderName,
   updateMember,
   writeTeam,
 } from "./state.js";
@@ -220,10 +224,7 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           return `Error: Team "${args.teamName}" not found.`;
         }
 
-        // Determine sender name
-        const senderInfo = await findTeamBySession(context.sessionID);
-        const senderName =
-          senderInfo !== null ? senderInfo.memberName : context.sessionID;
+        const senderName = await resolveSenderName(context.sessionID);
 
         // Resolve target session ID
         let targetSessionId: string;
@@ -234,10 +235,7 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           if (member === undefined) {
             return `Error: Member "${args.to}" not found in team "${args.teamName}".`;
           }
-          if (
-            member.status === "shutdown" ||
-            member.status === "shutdown_requested"
-          ) {
+          if (isMemberShutdown(member)) {
             return `Error: Member "${args.to}" is in shutdown state and cannot receive messages.`;
           }
           targetSessionId = member.sessionId;
@@ -276,33 +274,34 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           return `Error: Team "${args.teamName}" not found.`;
         }
 
-        const senderInfo = await findTeamBySession(context.sessionID);
-        const senderName =
-          senderInfo !== null ? senderInfo.memberName : context.sessionID;
+        const senderName = await resolveSenderName(context.sessionID);
 
         const prefixedMessage = `[Team broadcast from ${senderName}]: ${args.message}`;
-        const messaged: string[] = [];
 
-        for (const [memberName, member] of Object.entries(team.members)) {
-          if (member.sessionId === context.sessionID) continue; // skip sender
-          if (member.status !== "ready" && member.status !== "busy") {
-            continue;
-          }
-          try {
-            await client.session.promptAsync({
-              path: { id: member.sessionId },
-              body: {
-                parts: [{ type: "text" as const, text: prefixedMessage }],
-              },
-            });
-            messaged.push(memberName);
-          } catch (err) {
-            console.error(
-              `[team_broadcast] failed to message ${memberName}:`,
-              err,
-            );
-          }
-        }
+        const activeMembers = Object.entries(team.members).filter(
+          ([_, member]) =>
+            member.sessionId !== context.sessionID && isMemberActive(member),
+        );
+
+        const messaged: string[] = [];
+        await Promise.all(
+          activeMembers.map(async ([memberName, member]) => {
+            try {
+              await client.session.promptAsync({
+                path: { id: member.sessionId },
+                body: {
+                  parts: [{ type: "text" as const, text: prefixedMessage }],
+                },
+              });
+              messaged.push(memberName);
+            } catch (err) {
+              console.error(
+                `[team_broadcast] failed to message ${memberName}:`,
+                err,
+              );
+            }
+          }),
+        );
 
         if (messaged.length === 0) {
           return `Broadcast sent to no members (no active members found excluding sender).`;
@@ -398,7 +397,7 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           targets.push({ name: args.memberName, sessionId: member.sessionId });
         } else {
           for (const [name, member] of Object.entries(team.members)) {
-            if (member.status === "ready" || member.status === "busy") {
+            if (isMemberActive(member)) {
               targets.push({ name, sessionId: member.sessionId });
             }
           }
@@ -427,6 +426,77 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
       } catch (err) {
         console.error("[team_shutdown] error:", err);
         return `Error shutting down: ${String(err)}`;
+      }
+    },
+  });
+
+  // ---------------------------------------------------------------------------
+  // team_interrupt
+  // ---------------------------------------------------------------------------
+  const team_interrupt = tool({
+    description:
+      "Interrupt a busy team member mid-task and deliver a priority message. Aborts their current generation immediately, then queues the message as their next prompt.",
+    args: {
+      teamName: z.string().describe("Name of the team"),
+      memberName: z.string().describe("Name of the member to interrupt"),
+      message: z
+        .string()
+        .describe(
+          "Priority message or question to deliver after the interrupt",
+        ),
+    },
+    async execute(args, _context) {
+      try {
+        const team = await readTeam(args.teamName);
+        if (team === null) {
+          return `Error: Team "${args.teamName}" not found.`;
+        }
+
+        const member = team.members[args.memberName];
+        if (member === undefined) {
+          return `Error: Member "${args.memberName}" not found in team "${args.teamName}".`;
+        }
+        if (isMemberShutdown(member)) {
+          return `Error: Member "${args.memberName}" is in shutdown state and cannot be interrupted.`;
+        }
+
+        // Stop the member's current generation
+        const abortResult = await client.session.abort({
+          path: { id: member.sessionId },
+        });
+        if (abortResult.error !== undefined) {
+          return `Error: Failed to interrupt member "${args.memberName}": ${JSON.stringify(abortResult.error)}`;
+        }
+
+        const wasRunning = abortResult.data === true;
+
+        // Deliver the priority message immediately after abort
+        try {
+          await client.session.promptAsync({
+            path: { id: member.sessionId },
+            body: {
+              parts: [
+                {
+                  type: "text" as const,
+                  text: `[Priority interrupt from lead]: ${args.message}`,
+                },
+              ],
+            },
+          });
+        } catch (promptErr) {
+          console.error(
+            "[team_interrupt] promptAsync failed after abort:",
+            promptErr,
+          );
+          return `Member "${args.memberName}" interrupted, but failed to deliver message: ${String(promptErr)}`;
+        }
+
+        return wasRunning
+          ? `Member "${args.memberName}" interrupted and priority message delivered.`
+          : `Member "${args.memberName}" was idle — priority message delivered without interruption.`;
+      } catch (err) {
+        console.error("[team_interrupt] error:", err);
+        return `Error interrupting member: ${String(err)}`;
       }
     },
   });
@@ -494,7 +564,7 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
       try {
         const found = await findTeamBySession(context.sessionID);
         const memberName =
-          found !== null && found.memberName !== "__lead__"
+          found !== null && found.memberName !== LEAD_MEMBER_NAME
             ? found.memberName
             : context.sessionID;
 
@@ -572,9 +642,7 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           return `Error: Team "${args.teamName}" not found.`;
         }
 
-        const senderInfo = await findTeamBySession(context.sessionID);
-        const senderName =
-          senderInfo !== null ? senderInfo.memberName : "unknown";
+        const senderName = await resolveSenderName(context.sessionID);
         const senderId = context.sessionID;
 
         const validatedMentions: string[] = [];
@@ -596,13 +664,10 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
             : {}),
         });
 
-        for (const mentioned of validatedMentions) {
-          const member = team.members[mentioned];
-          if (
-            member &&
-            member.status !== "shutdown" &&
-            member.status !== "shutdown_requested"
-          ) {
+        await Promise.all(
+          validatedMentions.map(async (mentioned) => {
+            const member = team.members[mentioned];
+            if (!member || isMemberShutdown(member)) return;
             try {
               await client.session.promptAsync({
                 path: { id: member.sessionId },
@@ -621,8 +686,8 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
                 err,
               );
             }
-          }
-        }
+          }),
+        );
 
         return `Posted to channel: ${event.id}`;
       } catch (err) {
@@ -685,9 +750,7 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           return `Error: Team "${args.teamName}" not found.`;
         }
 
-        const senderInfo = await findTeamBySession(context.sessionID);
-        const senderName =
-          senderInfo !== null ? senderInfo.memberName : context.sessionID;
+        const senderName = await resolveSenderName(context.sessionID);
         const senderId = context.sessionID;
 
         await appendEvent(args.teamName, {
@@ -698,30 +761,30 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
         });
 
         const messaged: string[] = [];
-        for (const [memberName, member] of Object.entries(team.members)) {
-          if (member.status !== "ready" && member.status !== "busy") {
-            continue;
-          }
-          try {
-            await client.session.promptAsync({
-              path: { id: member.sessionId },
-              body: {
-                parts: [
-                  {
-                    type: "text" as const,
-                    text: `[Announcement from ${senderName}]: ${args.message}`,
-                  },
-                ],
-              },
-            });
-            messaged.push(memberName);
-          } catch (err) {
-            console.error(
-              `[team_announce] failed to message ${memberName}:`,
-              err,
-            );
-          }
-        }
+        await Promise.all(
+          Object.entries(team.members).map(async ([memberName, member]) => {
+            if (!isMemberActive(member)) return;
+            try {
+              await client.session.promptAsync({
+                path: { id: member.sessionId },
+                body: {
+                  parts: [
+                    {
+                      type: "text" as const,
+                      text: `[Announcement from ${senderName}]: ${args.message}`,
+                    },
+                  ],
+                },
+              });
+              messaged.push(memberName);
+            } catch (err) {
+              console.error(
+                `[team_announce] failed to message ${memberName}:`,
+                err,
+              );
+            }
+          }),
+        );
 
         return `Announcement sent to: ${messaged.join(", ")} (including sender).`;
       } catch (err) {
@@ -756,9 +819,7 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
           return `Error: Team "${args.teamName}" not found.`;
         }
 
-        const senderInfo = await findTeamBySession(context.sessionID);
-        const senderName =
-          senderInfo !== null ? senderInfo.memberName : context.sessionID;
+        const senderName = await resolveSenderName(context.sessionID);
         const senderId = context.sessionID;
 
         const event = await appendEvent(args.teamName, {
@@ -818,6 +879,7 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
     team_broadcast,
     team_status,
     team_shutdown,
+    team_interrupt,
     team_task_add,
     team_task_claim,
     team_task_done,

@@ -21,6 +21,7 @@ export const ansi = {
 const STATUS_COLORS: Record<string, string> = {
   ready: ansi.fg(2),
   busy: ansi.fg(3),
+  retrying: ansi.fg(5),
   error: ansi.fg(1),
   shutdown_requested: ansi.fg(5),
   shutdown: ansi.dim(),
@@ -67,6 +68,9 @@ function memberLine(
   } else if (status === "busy") {
     activityPct = 50 + Math.floor(Math.random() * 40);
     stateTag = "working";
+  } else if (status === "retrying") {
+    activityPct = 20;
+    stateTag = "retrying";
   } else if (status === "error") {
     activityPct = 100;
     stateTag = "ERROR";
@@ -127,6 +131,31 @@ export function renderTeamStatus(team: TeamConfig, maxRows = 8): string {
   );
 
   return lines.join("");
+}
+
+/**
+ * Plain-text team status summary — safe to send to the model as prompt context.
+ * No ANSI escape codes.
+ */
+export function renderTeamStatusPlain(team: TeamConfig): string {
+  const members = Object.values(team.members);
+  if (members.length === 0) return `Team ${team.name}: no members`;
+  const lines = [
+    `[Team ${team.name} — ${members.length} member${members.length !== 1 ? "s" : ""}]`,
+  ];
+  for (const m of members) {
+    const age = formatAge(m.spawnedAt);
+    let statusStr: string = m.status;
+    if (m.status === "retrying" && m.retryAttempt !== undefined) {
+      const nextSec =
+        m.retryNextMs !== undefined
+          ? `, retry in ${Math.ceil(m.retryNextMs / 1000)}s`
+          : "";
+      statusStr = `retrying (attempt ${m.retryAttempt}${nextSec})`;
+    }
+    lines.push(`  ${m.name}: ${statusStr} (${age})`);
+  }
+  return lines.join("\n");
 }
 
 export function renderSeparator(_width: number): string {

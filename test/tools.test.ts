@@ -36,7 +36,14 @@ type VoidResult = {
   response: Response;
 };
 
-function makeStubClient(sessionId = "stub-session-new") {
+type AbortResult = {
+  data: boolean;
+  error: undefined;
+  request: Request;
+  response: Response;
+};
+
+function makeStubClient(sessionId = "stub-session-new", abortResult = true) {
   return {
     session: {
       create: async () =>
@@ -53,6 +60,13 @@ function makeStubClient(sessionId = "stub-session-new") {
           request: new Request("http://localhost"),
           response: new Response(),
         }) satisfies VoidResult,
+      abort: async () =>
+        ({
+          data: abortResult,
+          error: undefined,
+          request: new Request("http://localhost"),
+          response: new Response(),
+        }) satisfies AbortResult,
     },
   } as unknown as Parameters<typeof createTools>[0];
 }
@@ -750,5 +764,103 @@ describe("team_react", () => {
     expect(reactionEvent).toBeDefined();
     expect(reactionEvent?.reaction).toBe("+1");
     expect(reactionEvent?.targetId).toBe(targetId);
+  });
+});
+
+describe("team_interrupt", () => {
+  it("returns error when team not found", async () => {
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_interrupt", {
+      teamName: "ghost",
+      memberName: "alice",
+      message: "check in",
+    });
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("returns error when member not found", async () => {
+    await seedTeam();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_interrupt", {
+      teamName: "alpha",
+      memberName: "nobody",
+      message: "check in",
+    });
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("returns error when member is in shutdown state", async () => {
+    await seedTeam({
+      members: {
+        alice: {
+          name: "alice",
+          sessionId: "alice-sess",
+          status: "shutdown_requested",
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: new Date().toISOString(),
+        },
+      },
+    });
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_interrupt", {
+      teamName: "alpha",
+      memberName: "alice",
+      message: "check in",
+    });
+    expect(result).toContain("Error");
+    expect(result).toContain("shutdown");
+  });
+
+  it("interrupts a busy member and confirms delivery", async () => {
+    await seedTeam({
+      members: {
+        alice: {
+          name: "alice",
+          sessionId: "alice-sess",
+          status: "busy",
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: new Date().toISOString(),
+        },
+      },
+    });
+    // abortResult=true means the session was running and was stopped
+    const tools = createTools(makeStubClient("stub-session-new", true));
+    const result = await callTool(tools, "team_interrupt", {
+      teamName: "alpha",
+      memberName: "alice",
+      message: "What is your current progress?",
+    });
+    expect(result).not.toContain("Error");
+    expect(result).toContain("interrupted");
+    expect(result).toContain("alice");
+  });
+
+  it("reports 'was idle' when member was not actively running", async () => {
+    await seedTeam({
+      members: {
+        alice: {
+          name: "alice",
+          sessionId: "alice-sess",
+          status: "ready",
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: new Date().toISOString(),
+        },
+      },
+    });
+    // abortResult=false means there was nothing to abort
+    const tools = createTools(makeStubClient("stub-session-new", false));
+    const result = await callTool(tools, "team_interrupt", {
+      teamName: "alpha",
+      memberName: "alice",
+      message: "What is your current progress?",
+    });
+    expect(result).not.toContain("Error");
+    expect(result).toContain("idle");
+    expect(result).toContain("delivered");
   });
 });

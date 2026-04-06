@@ -171,6 +171,152 @@ describe("createEventHandler", () => {
   });
 });
 
+describe("session.status events", () => {
+  it("sets member status to busy on session.status busy", async () => {
+    await writeTeam({
+      name: "status-team",
+      leadSessionId: "st-lead",
+      members: {
+        eve: {
+          name: "eve",
+          sessionId: "eve-sess",
+          status: "ready",
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: new Date().toISOString(),
+        },
+      },
+      tasks: {},
+      createdAt: new Date().toISOString(),
+    });
+
+    const { client, calls } = makeStubClient();
+    const handler = createEventHandler(client);
+
+    await handler({
+      event: {
+        type: "session.status",
+        properties: { sessionID: "eve-sess", status: { type: "busy" } },
+      },
+    });
+
+    // No lead notification for busy transitions
+    expect(calls.length).toBe(0);
+
+    const team = await readTeam("status-team");
+    expect(team?.members["eve"]?.status).toBe("busy");
+  });
+
+  it("sets member status to retrying and stores retry context", async () => {
+    await writeTeam({
+      name: "retry-team",
+      leadSessionId: "rt-lead",
+      members: {
+        frank: {
+          name: "frank",
+          sessionId: "frank-sess",
+          status: "busy",
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: new Date().toISOString(),
+        },
+      },
+      tasks: {},
+      createdAt: new Date().toISOString(),
+    });
+
+    const { client, calls } = makeStubClient();
+    const handler = createEventHandler(client);
+
+    await handler({
+      event: {
+        type: "session.status",
+        properties: {
+          sessionID: "frank-sess",
+          status: { type: "retry", attempt: 2, message: "rate limited", next: 30000 },
+        },
+      },
+    });
+
+    // No lead notification for retrying transitions
+    expect(calls.length).toBe(0);
+
+    const team = await readTeam("retry-team");
+    const frank = team?.members["frank"];
+    expect(frank?.status).toBe("retrying");
+    expect(frank?.retryAttempt).toBe(2);
+    expect(frank?.retryNextMs).toBe(30000);
+  });
+
+  it("ignores session.status idle (deferred to session.idle)", async () => {
+    await writeTeam({
+      name: "idle-status-team",
+      leadSessionId: "ist-lead",
+      members: {
+        grace: {
+          name: "grace",
+          sessionId: "grace-sess",
+          status: "busy",
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: new Date().toISOString(),
+        },
+      },
+      tasks: {},
+      createdAt: new Date().toISOString(),
+    });
+
+    const { client, calls } = makeStubClient();
+    const handler = createEventHandler(client);
+
+    await handler({
+      event: {
+        type: "session.status",
+        properties: { sessionID: "grace-sess", status: { type: "idle" } },
+      },
+    });
+
+    // No state change, no notification
+    expect(calls.length).toBe(0);
+    const team = await readTeam("idle-status-team");
+    expect(team?.members["grace"]?.status).toBe("busy"); // unchanged
+  });
+
+  it("clears retry context when member goes idle", async () => {
+    await writeTeam({
+      name: "clear-retry-team",
+      leadSessionId: "crt-lead",
+      members: {
+        henry: {
+          name: "henry",
+          sessionId: "henry-sess",
+          status: "retrying",
+          retryAttempt: 3,
+          retryNextMs: 10000,
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: new Date().toISOString(),
+        },
+      },
+      tasks: {},
+      createdAt: new Date().toISOString(),
+    });
+
+    const { client } = makeStubClient();
+    const handler = createEventHandler(client);
+
+    await handler({
+      event: { type: "session.idle", properties: { sessionID: "henry-sess" } },
+    });
+
+    const team = await readTeam("clear-retry-team");
+    const henry = team?.members["henry"];
+    expect(henry?.status).toBe("ready");
+    expect(henry?.retryAttempt).toBeUndefined();
+    expect(henry?.retryNextMs).toBeUndefined();
+  });
+});
+
 describe("recoverStaleMembers (via createEventHandler startup)", () => {
   it("marks busy and shutdown_requested members as error on startup", async () => {
     await writeTeam({
@@ -181,6 +327,16 @@ describe("recoverStaleMembers (via createEventHandler startup)", () => {
           name: "stale_busy",
           sessionId: "sb-sess",
           status: "busy",
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: new Date().toISOString(),
+        },
+        stale_retrying: {
+          name: "stale_retrying",
+          sessionId: "sr-sess",
+          status: "retrying",
+          retryAttempt: 1,
+          retryNextMs: 5000,
           agentType: "default",
           model: "claude-3",
           spawnedAt: new Date().toISOString(),
@@ -215,6 +371,7 @@ describe("recoverStaleMembers (via createEventHandler startup)", () => {
 
     const team = await readTeam("recovery-team");
     expect(team?.members["stale_busy"]?.status).toBe("error");
+    expect(team?.members["stale_retrying"]?.status).toBe("error");
     expect(team?.members["stale_shutdown"]?.status).toBe("error");
     // Non-stale member is untouched
     expect(team?.members["fine_ready"]?.status).toBe("ready");
