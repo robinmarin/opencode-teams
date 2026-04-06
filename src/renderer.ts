@@ -98,14 +98,14 @@ export function renderTeamStatus(team: TeamConfig, maxRows = 8): string {
   for (let i = 0; i < Math.min(members.length, maxRows - 2); i++) {
     const m = members.at(i);
     if (!m) continue;
-    const age = formatAge(m.spawnedAt);
-    const currentTask = m.status === "busy" ? "processing..." : "";
+    const age = formatAge(m.lastStatusAt ?? m.spawnedAt);
+    const currentTask = m.currentTask ?? "";
     lines.push(
       memberLine(
         i + 2,
         m.name,
         m.status,
-        "member",
+        m.agentType,
         currentTask,
         age,
         m.spawnedAt as string,

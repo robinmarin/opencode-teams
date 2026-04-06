@@ -20,7 +20,9 @@ export type TeamMember = {
   status: MemberStatus;
   agentType: string;
   model: string;
-  spawnedAt: string; // ISO timestamp
+  spawnedAt: string;
+  lastStatusAt?: string;
+  currentTask?: string;
   // Populated when status === "retrying"; cleared on any other status transition.
   retryAttempt?: number;
   retryNextMs?: number; // ms until the SDK fires the next attempt
@@ -223,6 +225,9 @@ export async function updateMember(
     if (existing === undefined) {
       throw new Error(`Member "${memberName}" not found in team "${teamName}"`);
     }
+    if (patch.status !== undefined && patch.status !== existing.status) {
+      patch.lastStatusAt = new Date().toISOString();
+    }
     const merged = { ...existing, ...patch } as TeamMember;
     for (const key of clear ?? []) delete merged[key];
     config.members[memberName] = merged;
@@ -314,6 +319,15 @@ export async function claimTask(
       status: "in_progress",
       assignee: memberName,
     };
+
+    const member = config.members[memberName];
+    if (member !== undefined) {
+      config.members[memberName] = {
+        ...member,
+        currentTask: task.title,
+      };
+    }
+
     const tmpPath = `${configPath}.tmp`;
     await fs.writeFile(tmpPath, JSON.stringify(config, null, 2), "utf-8");
     await fs.rename(tmpPath, configPath);

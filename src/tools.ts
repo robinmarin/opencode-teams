@@ -191,7 +191,7 @@ function makeTools(client: Client): Record<string, ToolDefinition> {
               name: args.memberName,
               sessionId,
               status: "busy",
-              agentType: "default",
+              agentType: args.role,
               model: args.model ?? "default",
               spawnedAt: now,
             },

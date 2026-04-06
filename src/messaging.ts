@@ -194,6 +194,7 @@ export function createEventHandler(
       await updateMember(team.name, memberName, { status: "ready" }, [
         "retryAttempt",
         "retryNextMs",
+        "currentTask",
       ]);
     } catch (err) {
       console.error(
