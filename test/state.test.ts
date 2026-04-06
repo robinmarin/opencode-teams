@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  appendBulletinPost,
   appendEvent,
   claimTask,
   completeTask,
@@ -11,6 +12,7 @@ import {
   listTeams,
   markStaleMembersAsError,
   pruneEvents,
+  readBulletinPosts,
   readTeam,
   setTestTeamsDir,
   updateMember,
@@ -417,5 +419,75 @@ describe("pruneEvents", () => {
     const { pruned, remaining } = await pruneEvents("small-team", 100);
     expect(pruned).toBe(0);
     expect(remaining).toBe(0);
+  });
+});
+
+describe("appendBulletinPost + readBulletinPosts", () => {
+  it("returns empty array when no posts exist", async () => {
+    await writeTeam(makeTeam({ name: "bul-team" }));
+    const posts = await readBulletinPosts("bul-team");
+    expect(posts).toEqual([]);
+  });
+
+  it("round-trips a bulletin post", async () => {
+    await writeTeam(makeTeam({ name: "bul-team" }));
+    const post = await appendBulletinPost("bul-team", {
+      author: "alice",
+      authorId: "sess-alice",
+      category: "finding",
+      title: "DB schema discovered",
+      body: "The users table has a soft-delete column `deleted_at`.",
+    });
+
+    expect(post.id).toMatch(/^bul_/);
+    expect(post.author).toBe("alice");
+    expect(post.category).toBe("finding");
+    expect(post.title).toBe("DB schema discovered");
+
+    const posts = await readBulletinPosts("bul-team");
+    expect(posts.length).toBe(1);
+    expect(posts[0]?.id).toBe(post.id);
+    expect(posts[0]?.body).toBe(post.body);
+  });
+
+  it("respects the limit parameter", async () => {
+    await writeTeam(makeTeam({ name: "bul-limit-team" }));
+    for (let i = 0; i < 5; i++) {
+      await appendBulletinPost("bul-limit-team", {
+        author: "bob",
+        authorId: "sess-bob",
+        category: "update",
+        title: `Update ${i}`,
+        body: `Body ${i}`,
+      });
+    }
+
+    const posts = await readBulletinPosts("bul-limit-team", 3);
+    expect(posts.length).toBe(3);
+    expect(posts[0]?.title).toBe("Update 2");
+    expect(posts[2]?.title).toBe("Update 4");
+  });
+
+  it("appends multiple posts in order", async () => {
+    await writeTeam(makeTeam({ name: "bul-order-team" }));
+    await appendBulletinPost("bul-order-team", {
+      author: "alice",
+      authorId: "sess-alice",
+      category: "blocker",
+      title: "Blocked on API key",
+      body: "Need the third-party API key to proceed.",
+    });
+    await appendBulletinPost("bul-order-team", {
+      author: "bob",
+      authorId: "sess-bob",
+      category: "question",
+      title: "Which endpoint?",
+      body: "Should I use /v1 or /v2?",
+    });
+
+    const posts = await readBulletinPosts("bul-order-team");
+    expect(posts.length).toBe(2);
+    expect(posts[0]?.category).toBe("blocker");
+    expect(posts[1]?.category).toBe("question");
   });
 });

@@ -613,6 +613,59 @@ export async function pruneEvents(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Bulletin board
+// ---------------------------------------------------------------------------
+
+export type BulletinCategory = "finding" | "blocker" | "question" | "update";
+
+export type BulletinPost = {
+  id: string;
+  author: string;
+  authorId: string;
+  timestamp: string;
+  category: BulletinCategory;
+  title: string;
+  body: string;
+};
+
+function bulletinFilePath(teamName: string): string {
+  return path.join(teamDir(teamName), "bulletin.jsonl");
+}
+
+export async function appendBulletinPost(
+  teamName: string,
+  post: Omit<BulletinPost, "id" | "timestamp">,
+): Promise<BulletinPost> {
+  const fullPost: BulletinPost = {
+    ...post,
+    id: `bul_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    timestamp: new Date().toISOString(),
+  };
+  const line = `${JSON.stringify(fullPost)}\n`;
+  await withLock(teamName, async () => {
+    const dir = teamDir(teamName);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.appendFile(bulletinFilePath(teamName), line, "utf-8");
+  });
+  return fullPost;
+}
+
+export async function readBulletinPosts(
+  teamName: string,
+  limit = 20,
+): Promise<BulletinPost[]> {
+  try {
+    const content = await fs.readFile(bulletinFilePath(teamName), "utf-8");
+    const lines = content.split("\n").filter((l) => l.trim() !== "");
+    const start = Math.max(0, lines.length - limit);
+    return lines.slice(start).map((l) => JSON.parse(l) as BulletinPost);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw err;
+  }
+}
+
 export async function listTeams(): Promise<string[]> {
   const dir = teamsDir();
   try {

@@ -3,6 +3,7 @@ import type { PluginInput, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { Logger } from "./logger.js";
 import {
+  appendBulletinPost,
   appendEvent,
   claimTask,
   completeTask,
@@ -13,6 +14,7 @@ import {
   LEAD_MEMBER_NAME,
   listTeams,
   pruneEvents,
+  readBulletinPosts,
   readDebugLogs,
   readTeam,
   resolveSenderName,
@@ -78,13 +80,26 @@ function makeTools(
         // to the lead's own session. This is acceptable — it frames the lead's
         // role at team creation time and appears once in their chat history.
         const leadBehaviourMsg = [
-          `[Team Protocol]: You are the lead of an agent team. Your role is to delegate work and synthesise results — not to micromanage. Follow these rules strictly:`,
+          `[Team Protocol] You are the lead of team "${args.name}". Your job is to set direction and synthesise results — not to dispatch or supervise every action.`,
           ``,
-          `When you spawn a teammate, trust them to complete their task. Do not message them again unless you have new specific instructions that change their task.`,
-          `When you receive an idle notification for a teammate, acknowledge it internally and wait. Do not call team_message or team_broadcast in response to an idle notification unless the task genuinely requires new input.`,
-          `Never send check-in messages like "how is it going?" or "any updates?". Teammates will notify you when they are done.`,
-          `Your job is to wait for results, synthesise them, and decide on next steps — not to fill silence with coordination overhead.`,
-          `If all teammates are busy, do nothing. Wait.`,
+          `Before spawning members:`,
+          `- Post shared context (goals, constraints, known facts) to team_bulletin_post so members start informed.`,
+          `- Add tasks to the board with team_task_add. Members self-claim — you do not need to assign work individually.`,
+          ``,
+          `After spawning:`,
+          `- Trust members to work autonomously. They will notify you the moment they finish. Do not message them in the meantime.`,
+          `- While members are busy, your only valid actions are read-only: team_timeline, team_bulletin_read, team_task_list, team_status. Do not call team_message, team_broadcast, or team_announce.`,
+          `- The urge to check in ("any updates?", "how is it going?", "just checking") is always wrong. It interrupts work in progress and adds no information — members cannot give you an update mid-task any better than you could read tea leaves. Suppress it.`,
+          `- If all members are busy and you have nothing to read, stop. Wait. Idleness on your part is correct behaviour, not a problem.`,
+          `- When you receive an idle notification, read the result and decide next steps. Do not automatically reply.`,
+          ``,
+          `When something goes wrong or you need the full picture:`,
+          `- team_timeline — chronological view of all messages, task events, and bulletin posts.`,
+          `- team_bulletin_read — shared findings and blockers posted by members.`,
+          `- team_task_list — see what's pending, in progress, or blocked.`,
+          `- team_logs — structured debug logs if you need to trace an event handler issue.`,
+          ``,
+          `To send genuinely new instructions to a specific member: team_message to="<name>". For a true emergency that cannot wait: team_interrupt. These are not for status checks.`,
         ].join("\n");
         try {
           await client.session.promptAsync({
@@ -234,11 +249,24 @@ function makeTools(
         });
 
         const systemPrompt = [
-          `You are "${args.memberName}", a ${args.role} on team "${args.teamName}".`,
-          `You were spawned to work on specific tasks. Complete them thoroughly.`,
-          `IMPORTANT: You must NOT use team management tools (team_create, team_spawn, team_status, team_shutdown, team_spawn). These are reserved for the team lead only.`,
-          `When you complete your task, send your results to the lead using: team_message with to="lead", teamName="${args.teamName}".`,
-          `You may also use team_post to broadcast updates to the whole team channel.`,
+          `[Team Protocol] You are "${args.memberName}", a ${args.role} on team "${args.teamName}".`,
+          ``,
+          `Do NOT use team management tools (team_create, team_spawn, team_shutdown). Those are lead-only.`,
+          ``,
+          `Before starting work:`,
+          `- Read team_bulletin_read. The lead may have posted context, constraints, or findings you need.`,
+          ``,
+          `While working:`,
+          `- If you need information a peer might have, ask them directly: team_message to="<memberName>". Don't route through the lead.`,
+          `- If you discover something the team should know (a finding, a blocker, a question), post it: team_bulletin_post.`,
+          ``,
+          `When you finish your current task:`,
+          `- Report results to the lead: team_message to="lead", teamName="${args.teamName}".`,
+          `- Check for more work: team_task_list status="pending", then team_task_claim to self-assign. Do not wait for the lead to give you the next task.`,
+          `- If nothing is pending and you have no more work, go idle.`,
+          ``,
+          `Before going idle:`,
+          `- Post any significant findings or unresolved blockers to team_bulletin_post so teammates and the lead have the full picture.`,
         ].join("\n");
 
         let modelOpt: { providerID: string; modelID: string } | undefined;
@@ -311,6 +339,12 @@ function makeTools(
           sessionId,
           teamName: args.teamName,
         });
+        await appendEvent(args.teamName, {
+          type: "system",
+          sender: LEAD_MEMBER_NAME,
+          senderId: _context.sessionID,
+          content: `spawned member "${args.memberName}" as ${args.role}`,
+        });
         return `Member "${args.memberName}" spawned (session: ${sessionId}). Initial prompt sent.`;
       } catch (err) {
         log.error("tool", "team_spawn failed", {
@@ -374,6 +408,19 @@ function makeTools(
             });
             return `Error: Member "${args.to}" is in shutdown state and cannot receive messages.`;
           }
+          // Soft guard: warn the lead against messaging busy members.
+          // Members cannot give useful updates mid-task; this message would
+          // only interrupt their work. Use team_interrupt for true emergencies.
+          if (
+            context.sessionID === team.leadSessionId &&
+            (member.status === "busy" || member.status === "retrying")
+          ) {
+            log.info("messaging", "team_message lead-to-busy-member blocked", {
+              to: args.to,
+              memberStatus: member.status,
+            });
+            return `Not sent. "${args.to}" is currently busy — messaging them mid-task interrupts their work and won't get you a useful response. They will notify you when done. If this genuinely cannot wait, use team_interrupt instead.`;
+          }
           targetSessionId = member.sessionId;
         }
 
@@ -381,6 +428,18 @@ function makeTools(
         await client.session.promptAsync({
           path: { id: targetSessionId },
           body: { parts: [{ type: "text" as const, text: prefixedMessage }] },
+        });
+
+        const recipient =
+          args.to === "lead" || args.to === LEAD_MEMBER_NAME
+            ? LEAD_MEMBER_NAME
+            : args.to;
+        await appendEvent(args.teamName, {
+          type: "message",
+          sender: senderName,
+          senderId: context.sessionID,
+          content: args.message,
+          mentions: [recipient],
         });
 
         log.info("messaging", "message sent", {
@@ -462,6 +521,15 @@ function makeTools(
           });
           return `Broadcast sent to no members (no active members found excluding sender).`;
         }
+
+        await appendEvent(args.teamName, {
+          type: "message",
+          sender: senderName,
+          senderId: context.sessionID,
+          content: `[broadcast] ${args.message}`,
+          mentions: messaged,
+        });
+
         log.info("messaging", "team_broadcast sent", {
           teamName: args.teamName,
           recipients: messaged,
@@ -646,7 +714,7 @@ function makeTools(
           "Priority message or question to deliver after the interrupt",
         ),
     },
-    async execute(args, _context) {
+    async execute(args, context) {
       const log = _getLogger(client, args.teamName);
       log.debug("tool", "team_interrupt called", {
         teamName: args.teamName,
@@ -717,6 +785,15 @@ function makeTools(
           });
           return `Member "${args.memberName}" interrupted, but failed to deliver message: ${String(promptErr)}`;
         }
+
+        const senderName = await resolveSenderName(context.sessionID);
+        await appendEvent(args.teamName, {
+          type: "message",
+          sender: senderName,
+          senderId: context.sessionID,
+          content: `[interrupt] ${args.message}`,
+          mentions: [args.memberName],
+        });
 
         log.info("tool", "member interrupted", {
           teamName: args.teamName,
@@ -843,6 +920,13 @@ function makeTools(
           taskId: args.taskId,
           memberName,
         });
+        await appendEvent(args.teamName, {
+          type: "task",
+          sender: memberName,
+          senderId: context.sessionID,
+          content: `claimed task ${args.taskId}`,
+          targetId: args.taskId,
+        });
         return `Task "${args.taskId}" claimed by "${memberName}" and is now in_progress.`;
       } catch (err) {
         log.error("tool", "team_task_claim failed", {
@@ -866,7 +950,7 @@ function makeTools(
       teamName: z.string().describe("Name of the team"),
       taskId: z.string().describe("ID of the task to mark as completed"),
     },
-    async execute(args, _context) {
+    async execute(args, context) {
       const log = _getLogger(client, args.teamName);
       log.debug("tool", "team_task_done called", {
         teamName: args.teamName,
@@ -890,6 +974,18 @@ function makeTools(
           teamName: args.teamName,
           taskId: args.taskId,
           unblocked: result.unblockedTaskIds,
+        });
+        const senderName = await resolveSenderName(context.sessionID);
+        const completedContent =
+          result.unblockedTaskIds.length > 0
+            ? `completed task ${args.taskId} — unblocked: ${result.unblockedTaskIds.join(", ")}`
+            : `completed task ${args.taskId}`;
+        await appendEvent(args.teamName, {
+          type: "task",
+          sender: senderName,
+          senderId: context.sessionID,
+          content: completedContent,
+          targetId: args.taskId,
         });
         return `Task "${args.taskId}" marked as completed.${unblockedMsg}`;
       } catch (err) {
@@ -1566,6 +1662,189 @@ function makeTools(
     },
   });
 
+  // ---------------------------------------------------------------------------
+  // team_bulletin_post
+  // ---------------------------------------------------------------------------
+  const team_bulletin_post = tool({
+    description:
+      "Post a finding, blocker, question, or update to the team's shared bulletin board. Other members read this before escalating to the lead.",
+    args: {
+      teamName: z.string().describe("Name of the team"),
+      category: z
+        .enum(["finding", "blocker", "question", "update"])
+        .describe(
+          "finding: discovered information; blocker: something preventing progress; question: need input; update: progress note",
+        ),
+      title: z.string().describe("Short summary (one line)"),
+      body: z.string().describe("Full content of the post"),
+    },
+    async execute(args, context) {
+      const log = _getLogger(client, args.teamName);
+      log.debug("tool", "team_bulletin_post called", {
+        teamName: args.teamName,
+        category: args.category,
+        senderSessionId: context.sessionID,
+      });
+      try {
+        const team = await readTeam(args.teamName);
+        if (team === null) {
+          return `Error: Team "${args.teamName}" not found.`;
+        }
+        const author = await resolveSenderName(context.sessionID);
+        const post = await appendBulletinPost(args.teamName, {
+          author,
+          authorId: context.sessionID,
+          category: args.category,
+          title: args.title,
+          body: args.body,
+        });
+        log.info("tool", "bulletin post created", {
+          teamName: args.teamName,
+          postId: post.id,
+          category: args.category,
+        });
+        return `Bulletin post created: ${post.id}`;
+      } catch (err) {
+        log.error("tool", "team_bulletin_post failed", {
+          teamName: args.teamName,
+          error: String(err),
+        });
+        return `Error posting to bulletin: ${String(err)}`;
+      }
+    },
+  });
+
+  // ---------------------------------------------------------------------------
+  // team_bulletin_read
+  // ---------------------------------------------------------------------------
+  const team_bulletin_read = tool({
+    description:
+      "Read recent posts from the team's shared bulletin board. Check this before asking the lead or a peer for information that may already be documented.",
+    args: {
+      teamName: z.string().describe("Name of the team"),
+      limit: z
+        .number()
+        .optional()
+        .default(20)
+        .describe("Number of recent posts to retrieve (default: 20)"),
+    },
+    async execute(args, _context) {
+      const log = _getLogger(client, args.teamName);
+      log.debug("tool", "team_bulletin_read called", {
+        teamName: args.teamName,
+        limit: args.limit,
+      });
+      try {
+        const team = await readTeam(args.teamName);
+        if (team === null) {
+          return `Error: Team "${args.teamName}" not found.`;
+        }
+        const posts = await readBulletinPosts(args.teamName, args.limit);
+        if (posts.length === 0) {
+          return "No bulletin posts yet.";
+        }
+        const lines = posts.map(
+          (p) =>
+            `[${p.timestamp}] [${p.category.toUpperCase()}] ${p.author}: ${p.title}\n  ${p.body}`,
+        );
+        return ["Bulletin board:", ...lines].join("\n\n");
+      } catch (err) {
+        log.error("tool", "team_bulletin_read failed", {
+          teamName: args.teamName,
+          error: String(err),
+        });
+        return `Error reading bulletin: ${String(err)}`;
+      }
+    },
+  });
+
+  // ---------------------------------------------------------------------------
+  // team_timeline
+  // ---------------------------------------------------------------------------
+  const team_timeline = tool({
+    description:
+      "Unified chronological view of all team activity: messages, task events, status changes, bulletin posts, and system events — merged and sorted by time. Use this for debugging coordination and reviewing what happened.",
+    args: {
+      teamName: z.string().describe("Name of the team"),
+      limit: z
+        .number()
+        .optional()
+        .default(50)
+        .describe(
+          "Total number of entries to show across all sources (default: 50)",
+        ),
+    },
+    async execute(args, _context) {
+      const log = _getLogger(client, args.teamName);
+      log.debug("tool", "team_timeline called", {
+        teamName: args.teamName,
+        limit: args.limit,
+      });
+      try {
+        const team = await readTeam(args.teamName);
+        if (team === null) {
+          return `Error: Team "${args.teamName}" not found.`;
+        }
+
+        // Fetch more than the limit from each source so the merge has enough
+        // entries to fill the requested window after sorting.
+        const fetchN = args.limit * 2;
+        const [{ events }, bulletinPosts] = await Promise.all([
+          getEvents(args.teamName, fetchN),
+          readBulletinPosts(args.teamName, fetchN),
+        ]);
+
+        type TimelineEntry = { timestamp: string; line: string };
+        const entries: TimelineEntry[] = [];
+
+        for (const e of events) {
+          let label: string;
+          if (e.type === "task") {
+            label = `[TASK]`;
+          } else if (e.type === "system") {
+            label = `[SYSTEM]`;
+          } else if (e.type === "status") {
+            label = `[STATUS]`;
+          } else if (e.type === "reaction") {
+            label = `[REACT]`;
+          } else {
+            const to =
+              e.mentions && e.mentions.length > 0
+                ? ` → ${e.mentions.join(", ")}`
+                : "";
+            label = `[MSG${to}]`;
+          }
+          entries.push({
+            timestamp: e.timestamp,
+            line: `${e.timestamp} ${label} ${e.sender}: ${e.content}`,
+          });
+        }
+
+        for (const p of bulletinPosts) {
+          entries.push({
+            timestamp: p.timestamp,
+            line: `${p.timestamp} [${p.category.toUpperCase()}] ${p.author}: ${p.title} — ${p.body}`,
+          });
+        }
+
+        entries.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+        const selected = entries.slice(-args.limit);
+
+        if (selected.length === 0) {
+          return "No activity recorded yet.";
+        }
+
+        return [`Timeline for "${args.teamName}":`, ...selected.map((e) => e.line)].join("\n");
+      } catch (err) {
+        log.error("tool", "team_timeline failed", {
+          teamName: args.teamName,
+          error: String(err),
+        });
+        return `Error reading timeline: ${String(err)}`;
+      }
+    },
+  });
+
   return {
     team_create,
     team_spawn,
@@ -1588,6 +1867,9 @@ function makeTools(
     team_task_update,
     team_member_info,
     team_logs,
+    team_bulletin_post,
+    team_bulletin_read,
+    team_timeline,
   };
 }
 
