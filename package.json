@@ -25,7 +25,8 @@
     "build": "tsc",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "lint": "biome check src"
+    "lint": "biome check src",
+    "log": "bun scripts/team-log.ts"
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.3.15",

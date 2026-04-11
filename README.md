@@ -131,6 +131,23 @@ State is read directly from `~/.config/opencode/teams/*/config.json` via `fs.wat
 
 ---
 
+## Log Visualizer
+
+`scripts/team-log.ts` renders a color-coded timeline of team activity from `events.jsonl`. Run it in a separate terminal alongside an active session:
+
+```bash
+bun scripts/team-log.ts [team-name] [-f] [--debug] [--no-status] [--no-system] [--since HH:MM]
+# or
+bun run log [team-name] -f
+```
+
+- Omit `team-name` to auto-pick the most recently active team
+- `-f` / `--follow` — tail live (polls every 500ms)
+- `--debug` — overlay high-signal entries from `debug.jsonl` (anti-loop guards, spawn confirmations, etc.)
+- `--no-status` / `--no-system` — filter out noise
+
+---
+
 ## Debuggable Logs
 
 Every tool call is automatically logged with structured entries. Logs are written to:
