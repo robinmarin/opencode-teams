@@ -11,11 +11,14 @@
  *   --no-status      hide status-change events
  *   --no-system      hide system events (spawns, shutdowns)
  *   --since <time>   only show events after HH:MM or ISO timestamp
+ *   --html           write swimlane report as team.html
+ *   --open           auto-open HTML report in browser
+ *   --lanes          terminal swimlane view (best-effort)
  *
  * Defaults to the most recently modified team if no name given.
  */
 
-import { readFileSync, existsSync, statSync, readdirSync } from "fs";
+import { readFileSync, existsSync, statSync, readdirSync, writeFileSync } from "fs";
 import { join } from "path";
 import { watch } from "fs";
 
@@ -51,6 +54,9 @@ const follow = flags.has("-f") || flags.has("--follow");
 const showDebug = flags.has("--debug");
 const hideStatus = flags.has("--no-status");
 const hideSystem = flags.has("--no-system");
+const generateHtml = flags.has("--html");
+const autoOpen = flags.has("--open");
+const showLanes = flags.has("--lanes");
 
 const sinceIdx = args.findIndex((a) => a === "--since");
 const sinceRaw = sinceIdx >= 0 ? args[sinceIdx + 1] : null;
@@ -323,6 +329,299 @@ function buildTimeline(evLines: string[], dbgLines: string[]): Timestamped[] {
   return items;
 }
 
+// ─── HTML report ─────────────────────────────────────────────────────────────
+
+interface HtmlEvent {
+  type: "system" | "status" | "message";
+  sender: string;
+  senderId: string;
+  content: string;
+  mentions?: string[];
+  status?: string;
+  memberName?: string;
+  id: string;
+  timestamp: string;
+}
+
+interface StatusSpan {
+  member: string;
+  status: "busy" | "ready" | "retrying" | "error" | "shutdown";
+  from: string;
+  to: string;
+}
+
+function generateHtmlReport(
+  teamName: string,
+  events: HtmlEvent[],
+  members: string[],
+  leadName: string,
+  outputPath: string,
+  doOpen: boolean,
+  doFollow: boolean
+): void {
+  const allAgents = [leadName, ...members];
+
+  const statusSpans: StatusSpan[] = [];
+  const memberLastStatus: Record<string, { status: string; ts: string }> = {};
+
+  for (const ev of events) {
+    if (ev.type === "status") {
+      const name = ev.memberName ?? ev.sender;
+      const lastWord = ev.content?.split(" ").pop() ?? ev.status ?? "ready";
+      let status: StatusSpan["status"] = "ready";
+      if (lastWord === "busy") status = "busy";
+      else if (lastWord === "retrying") status = "retrying";
+      else if (lastWord === "shutdown") status = "shutdown";
+      else if (lastWord === "error") status = "error";
+
+      if (memberLastStatus[name]) {
+        const prev = memberLastStatus[name];
+        statusSpans.push({ member: name, status: prev.status as StatusSpan["status"], from: prev.ts, to: ev.timestamp });
+      }
+      memberLastStatus[name] = { status, ts: ev.timestamp };
+    }
+  }
+
+  for (const m of allAgents) {
+    if (!memberLastStatus[m]) {
+      memberLastStatus[m] = { status: "ready", ts: events[0]?.timestamp ?? new Date().toISOString() };
+    }
+  }
+
+  const messages = events.filter((e) => e.type === "message");
+  const sysEvents = events.filter((e) => e.type === "system");
+
+  const esc = (s: string) =>
+    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+  const fmtTime = (iso: string) => iso.slice(11, 19);
+
+  const STATUS_COLORS: Record<string, string> = {
+    busy: "#f59e0b",
+    ready: "#22c55e",
+    retrying: "#a855f7",
+    error: "#ef4444",
+    shutdown: "#6b7280",
+  };
+
+  const AGENT_COLORS = [
+    "#06b6d4", "#eab308", "#22c55e", "#a855f7", "#3b82f6", "#ef4444", "#f97316", "#ec4899",
+  ];
+
+  const agentColorMap = new Map<string, string>();
+  allAgents.forEach((a, i) => agentColorMap.set(a, AGENT_COLORS[i % AGENT_COLORS.length]));
+
+  const memberColWidth = 160;
+  const timeColWidth = 80;
+  const colWidth = memberColWidth;
+  const totalWidth = timeColWidth + allAgents.length * colWidth + 20;
+
+  let html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Team: ${esc(teamName)} — Timeline Report</title>`;
+
+  if (doFollow) {
+    html += `\n<meta http-equiv="refresh" content="2">`;
+  }
+
+  html += `
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+.container { max-width: 100vw; overflow-x: auto; padding: 16px; }
+h1 { font-size: 18px; font-weight: 600; margin-bottom: 12px; color: #f8fafc; }
+.meta { font-size: 12px; color: #64748b; margin-bottom: 16px; }
+.chart { display: grid; grid-template-columns: ${timeColWidth}px ${allAgents.map(() => colWidth + "px").join(" ")}; border: 1px solid #1e293b; border-radius: 6px; overflow: hidden; font-size: 12px; }
+.header-cell { background: #1e293b; padding: 8px 6px; font-weight: 600; text-align: center; border-bottom: 1px solid #334155; position: sticky; top: 0; z-index: 10; }
+.header-cell.lead { color: #22d3ee; }
+.time-cell { background: #1e293b; color: #64748b; padding: 4px 6px; border-right: 1px solid #334155; display: flex; align-items: center; font-size: 11px; }
+.agent-cell { border-right: 1px solid #1e293b; position: relative; min-height: 40px; }
+.row { display: contents; }
+.row:hover .time-cell { background: #1e3a5f; }
+.row:hover .agent-cell { background: #1a2744; }
+.status-bar { position: absolute; top: 2px; left: 0; right: 0; height: 6px; border-radius: 3px; }
+.status-bar.busy { background: #f59e0b; }
+.status-bar.ready { background: #22c55e; }
+.status-bar.retrying { background: #a855f7; }
+.status-bar.error { background: #ef4444; }
+.status-bar.shutdown { background: #6b7280; }
+.msg-row { display: flex; align-items: center; height: 36px; padding: 2px 4px; cursor: pointer; }
+.msg-row:hover { background: #1e3a5f; border-radius: 4px; }
+.msg-arrow { flex: 1; display: flex; align-items: center; overflow: hidden; height: 100%; }
+.arrow-line { height: 2px; flex: 1; }
+.arrow-head { width: 0; height: 0; border-top: 5px solid transparent; border-bottom: 5px solid transparent; border-left: 8px solid currentColor; }
+.msg-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; margin: 0 4px; }
+.msg-text { margin-left: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 120px; color: #94a3b8; }
+.tooltip { position: fixed; background: #1e293b; border: 1px solid #334155; border-radius: 6px; padding: 10px 14px; font-size: 13px; max-width: 400px; z-index: 100; display: none; box-shadow: 0 10px 40px rgba(0,0,0,0.5); }
+.tooltip.show { display: block; }
+.tooltip pre { white-space: pre-wrap; word-break: break-word; margin-top: 6px; color: #cbd5e1; }
+.tooltip .msg-header { font-weight: 600; color: #e2e8f0; }
+.tooltip .msg-time { font-size: 11px; color: #64748b; margin-bottom: 4px; }
+.legend { display: flex; gap: 16px; margin-bottom: 12px; font-size: 12px; }
+.legend-item { display: flex; align-items: center; gap: 6px; }
+.legend-dot { width: 10px; height: 10px; border-radius: 50%; }
+.sys-row { grid-column: 1 / -1; padding: 4px 8px; color: #475569; font-style: italic; font-size: 11px; }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>Team: ${esc(teamName)}</h1>
+<div class="meta">${events.length} events · ${allAgents.length} agents · ${outputPath}</div>
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot" style="background:#22c55e"></div>ready</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#f59e0b"></div>busy</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#a855f7"></div>retrying</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#ef4444"></div>error</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#6b7280"></div>shutdown</div>
+</div>
+<div class="chart" id="chart">`;
+
+  html += `<div class="header-cell">Time</div>`;
+  for (const agent of allAgents) {
+    const isLead = agent === leadName;
+    html += `<div class="header-cell${isLead ? " lead" : ""}">${esc(agent)}${isLead ? " ★" : ""}</div>`;
+  }
+
+  const statusAtTs: Record<string, Record<string, StatusSpan["status"]>> = {};
+  const openSpans: Record<string, StatusSpan> = {};
+
+  function getStatusAt(member: string, ts: string): StatusSpan["status"] {
+    if (statusAtTs[ts]?.[member]) return statusAtTs[ts][member];
+    const sorted = events.filter((e) => e.timestamp <= ts && e.type === "status");
+    const lastStatus = sorted.filter((e) => (e.memberName ?? e.sender) === member).slice(-1)[0];
+    const lastWord = lastStatus?.content?.split(" ").pop() ?? lastStatus?.status ?? "ready";
+    if (lastWord === "busy") return "busy";
+    if (lastWord === "retrying") return "retrying";
+    if (lastWord === "shutdown") return "shutdown";
+    if (lastWord === "error") return "error";
+    return "ready";
+  }
+
+  const timelineEvents = events.filter((e) => e.type === "message" || e.type === "system");
+  const firstTs = events[0]?.timestamp ?? new Date().toISOString();
+  const lastTs = events[events.length - 1]?.timestamp ?? new Date().toISOString();
+
+  const stepMs = 60000;
+  let curTs = firstTs.slice(0, 14) + "00:00.000Z";
+  while (curTs <= lastTs) {
+    const rowTime = curTs.slice(11, 19);
+    const rowIso = curTs;
+
+    html += `<div class="row">`;
+    html += `<div class="time-cell">${esc(rowTime)}</div>`;
+
+    for (const agent of allAgents) {
+      const st = getStatusAt(agent, rowIso);
+      const color = STATUS_COLORS[st] ?? "#22c55e";
+      html += `<div class="agent-cell">
+        <div class="status-bar ${esc(st)}" style="background:${color}"></div>
+      </div>`;
+    }
+
+    html += `</div>`;
+    curTs = new Date(new Date(curTs).getTime() + stepMs).toISOString();
+  }
+
+  const msgEvents = events.filter((e) => e.type === "message");
+  for (const ev of msgEvents) {
+    const from = ev.sender === "__lead__" ? leadName : (ev.sender && !ev.sender.startsWith("ses_") ? ev.sender : resolveSession(ev.senderId));
+    const mentions = ev.mentions ?? [];
+    const toNames = mentions.length > 0
+      ? mentions.map((m) => (m === "__lead__" ? leadName : m))
+      : allAgents;
+    const content = ev.content ?? "";
+    const short = content.split("\n")[0].slice(0, 40);
+    const fullEsc = esc(content);
+    const shortEsc = esc(short);
+    const timeEsc = esc(fmtTime(ev.timestamp));
+    const fromColor = agentColorMap.get(from) ?? "#06b6d4";
+    const toColor = toNames[0] ? (agentColorMap.get(toNames[0]) ?? "#06b6d4") : fromColor;
+    const fromIdx = allAgents.indexOf(from);
+    const firstToIdx = toNames[0] ? allAgents.indexOf(toNames[0]) : 0;
+    const arrowDir = firstToIdx >= fromIdx ? "right" : "left";
+
+    html += `<div class="row">`;
+    html += `<div class="time-cell">${timeEsc}</div>`;
+
+    for (let ci = 0; ci < allAgents.length; ci++) {
+      const agent = allAgents[ci];
+      const isFrom = ci === fromIdx;
+      const isTo = toNames.includes(agent);
+      const cellBg = isFrom ? "background:#1e3a5f;border-radius:4px;margin:2px 0;" : "";
+
+      html += `<div class="agent-cell" style="${cellBg}">`;
+
+      if (isFrom) {
+        html += `<div class="msg-row" data-msg="${esc(fullEsc)}" data-from="${esc(from)}" data-to="${toNames.map(esc).join(", ")}">`;
+        html += `<div class="msg-arrow" style="color:${fromColor}">`;
+        html += `<div class="msg-dot" style="background:${fromColor}"></div>`;
+        html += `<div class="arrow-line" style="background:${fromColor}"></div>`;
+        if (arrowDir === "right") {
+          html += `<div class="arrow-head" style="border-left-color:${fromColor}"></div>`;
+        }
+        html += `</div>`;
+        html += `<div class="msg-text" title="${esc(content)}">${shortEsc}</div>`;
+        html += `</div>`;
+      } else if (isTo) {
+        html += `<div class="msg-row">`;
+        html += `<div class="msg-arrow" style="color:${toColor}">`;
+        if (arrowDir === "left") {
+          html += `<div class="arrow-head" style="border-left-color:${toColor};transform:rotate(180deg)"></div>`;
+        }
+        html += `<div class="arrow-line" style="background:${toColor}"></div>`;
+        html += `<div class="msg-dot" style="background:${toColor}"></div>`;
+        html += `</div>`;
+        html += `<div class="msg-text">${shortEsc}</div>`;
+        html += `</div>`;
+      }
+
+      html += `</div>`;
+    }
+
+    html += `</div>`;
+  }
+
+  for (const ev of sysEvents) {
+    html += `<div class="row sys-row"><div class="time-cell">${esc(fmtTime(ev.timestamp))}</div><div>${esc(ev.content)}</div></div>`;
+  }
+
+  html += `
+</div>
+<div class="tooltip" id="tooltip"></div>
+<script>
+document.querySelectorAll('.msg-row[data-msg]').forEach(el => {
+  el.addEventListener('click', (e) => {
+    const tip = document.getElementById('tooltip');
+    const msg = el.getAttribute('data-msg') ?? '';
+    const from = el.getAttribute('data-from') ?? '';
+    const to = el.getAttribute('data-to') ?? '';
+    tip.innerHTML = '<div class="msg-time">' + from + ' → ' + to + '</div><pre>' + msg + '</pre>';
+    tip.classList.add('show');
+    const rect = el.getBoundingClientRect();
+    tip.style.left = Math.min(rect.left, window.innerWidth - 420) + 'px';
+    tip.style.top = (rect.bottom + 8) + 'px';
+    e.stopPropagation();
+  });
+});
+document.addEventListener('click', () => {
+  document.getElementById('tooltip').classList.remove('show');
+});
+</script>
+</div>
+</body>
+</html>`;
+
+  writeFileSync(outputPath, html, "utf8");
+
+  if (doOpen) {
+    const openCmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+    Bun.spawn([openCmd, outputPath], { stdio: "inherit" });
+  }
+}
+
 // ─── Header ───────────────────────────────────────────────────────────────────
 
 function printHeader() {
@@ -354,6 +653,256 @@ const evLines = readLines(eventsPath);
 const dbgLines = showDebug ? readLines(debugPath) : [];
 const timeline = buildTimeline(evLines, dbgLines);
 
+if (generateHtml) {
+  const htmlEvents: HtmlEvent[] = [];
+  for (const line of evLines) {
+    try { htmlEvents.push(JSON.parse(line) as HtmlEvent); } catch {}
+  }
+
+  const memberNames = config ? Object.keys(config.members) : [];
+  const leadName = "__lead__";
+  const outputPath = join(teamDir, "report.html");
+  generateHtmlReport(teamName, htmlEvents, memberNames, leadName, outputPath, autoOpen, follow);
+
+  if (!follow) {
+    process.exit(0);
+  }
+}
+
+if (showLanes) {
+  const htmlEvents: HtmlEvent[] = [];
+  for (const line of evLines) {
+    try { htmlEvents.push(JSON.parse(line) as HtmlEvent); } catch {}
+  }
+  const memberNames = config ? Object.keys(config.members) : [];
+  const allAgents = ["__lead__", ...memberNames];
+
+  function displayName(name: string): string {
+    return name === "__lead__" ? "lead" : name;
+  }
+
+  const termWidth = (process.stdout as { columns?: number }).columns ?? 200;
+  const timeColWidth = 9;
+  const maxAgentName = allAgents.reduce((m, a) => Math.max(m, displayName(a).length), 0);
+  const agentColWidth = Math.max(10, maxAgentName + 2);
+  const maxAgents = Math.min(allAgents.length, Math.floor((termWidth - timeColWidth - 1) / agentColWidth));
+  const visibleAgents = allAgents.slice(0, maxAgents);
+  const hiddenCount = allAgents.length - maxAgents;
+
+  function colStart(colIdx: number): number {
+    return timeColWidth + 1 + colIdx * agentColWidth;
+  }
+
+  function rowForTime(time: string): string {
+    return (time + " ").padEnd(timeColWidth + 1) + visibleAgents.map((_, i) => " ".repeat(agentColWidth)).join("");
+  }
+
+  function renderHeader(): void {
+    const timeHdr = B("TIME".padEnd(timeColWidth)) + " ";
+    const agentsHdr = visibleAgents.map((a) => B(displayName(a).padEnd(agentColWidth))).join("");
+    console.log(timeHdr + agentsHdr + (hiddenCount > 0 ? DIM(` +${hiddenCount}`) : ""));
+    console.log(DIM("─".repeat(timeColWidth + 1 + visibleAgents.length * agentColWidth)));
+  }
+
+  const filtered = htmlEvents.filter((e) => e.type === "status" || e.type === "message");
+  let lastTsFormatted = "\n";
+
+  function sameTs(ts: string): boolean {
+    const t = fmtTime(ts);
+    return lastTsFormatted !== "\n" && t === lastTsFormatted;
+  }
+
+  renderHeader();
+
+  for (const ev of filtered) {
+    if (ev.type === "status") {
+      const name = ev.memberName ?? ev.sender;
+      const lastWord = ev.content?.split(" ").pop() ?? ev.status ?? "ready";
+      statusMap[name] = lastWord;
+      const agentIdx = allAgents.indexOf(name);
+      if (agentIdx >= maxAgents) continue;
+      const timeStr = sameTs(ev.timestamp) ? "─".repeat(timeColWidth) : fmtTime(ev.timestamp);
+      if (!sameTs(ev.timestamp)) lastTsFormatted = fmtTime(ev.timestamp);
+
+      let row = rowForTime(timeStr);
+      const label = lastWord === "busy" ? DIM("[busy]") : DIM("[ready]");
+      row = row.slice(0, colStart(agentIdx)) + label + row.slice(colStart(agentIdx) + label.length);
+      console.log(row + (hiddenCount > 0 ? DIM(` +${hiddenCount}`) : ""));
+    }
+
+    if (ev.type === "message") {
+      const from = ev.sender === "__lead__" ? "__lead__" : (ev.sender && !ev.sender.startsWith("ses_") ? ev.sender : resolveSession(ev.senderId));
+      const mentions = ev.mentions ?? [];
+      const recipients = mentions.length > 0 ? mentions : allAgents.filter((a) => a !== from);
+      const content = (ev.content ?? "").split("\n")[0];
+
+      const fromIdx = allAgents.indexOf(from);
+      const toIdxs = recipients
+        .map((r) => allAgents.indexOf(r))
+        .filter((idx) => idx >= 0 && idx < maxAgents && idx !== fromIdx);
+
+      if (fromIdx < 0 || fromIdx >= maxAgents) continue;
+      if (toIdxs.length === 0) continue;
+
+      const timeStr = sameTs(ev.timestamp) ? "─".repeat(timeColWidth) : fmtTime(ev.timestamp);
+      if (!sameTs(ev.timestamp)) lastTsFormatted = fmtTime(ev.timestamp);
+
+      let row = rowForTime(timeStr);
+      const firstTo = toIdxs[0];
+      const toName = displayName(visibleAgents[firstTo]);
+
+      const arrowStr = "→" + toName;
+      row = row.slice(0, colStart(fromIdx)) + arrowStr + row.slice(colStart(fromIdx) + arrowStr.length);
+
+      const dashStart = colStart(fromIdx) + arrowStr.length;
+      const dashEnd = colStart(firstTo);
+      const dashLen = Math.max(0, Math.min(dashEnd - dashStart, termWidth - dashStart));
+      if (dashLen > 0) {
+        row = row.slice(0, dashStart) + DIM("─".repeat(dashLen)) + row.slice(dashStart + dashLen);
+      }
+
+      const maxContent = agentColWidth - 3;
+      const contentStr = `"${content.slice(0, maxContent)}${content.length > maxContent ? "…" : ""}"`;
+      const contentStart = colStart(firstTo);
+      row = row.slice(0, contentStart) + DIM(contentStr) + row.slice(contentStart + contentStr.length);
+
+      console.log(row + (hiddenCount > 0 ? DIM(` +${hiddenCount}`) : ""));
+    }
+  }
+
+  if (!follow) {
+    process.exit(0);
+  }
+}
+  const memberNames = config ? Object.keys(config.members) : [];
+  const allAgents = ["__lead__", ...memberNames];
+
+  function displayName(name: string): string {
+    return name === "__lead__" ? "lead" : name;
+  }
+
+  const termWidth = (process.stdout as { columns?: number }).columns ?? 200;
+  const timeColWidth = 9;
+  const agentColWidth = Math.max(12, allAgents.reduce((m, a) => Math.max(m, displayName(a).length), 0) + 2);
+  const maxAgents = Math.min(allAgents.length, Math.floor((termWidth - timeColWidth - 1) / agentColWidth));
+  const visibleAgents = allAgents.slice(0, maxAgents);
+  const hiddenCount = allAgents.length - maxAgents;
+  const rowWidth = timeColWidth + 1 + maxAgents * agentColWidth;
+
+  function colStart(colIdx: number): number {
+    return timeColWidth + 1 + colIdx * agentColWidth;
+  }
+
+  function writeAt(row: string, start: number, s: string): string {
+    const before = row.slice(0, start);
+    const after = row.slice(start + s.length);
+    return before + s + after;
+  }
+
+  function writeDimAt(row: string, start: number, s: string): string {
+    const d = "\x1b[2m";
+    const r = "\x1b[0m";
+    const before = row.slice(0, start);
+    const after = row.slice(start + s.length);
+    return before + d + s + r + after;
+  }
+
+  function flushRow(row: string): void {
+    if (hiddenCount > 0) row += DIM(` +${hiddenCount}`);
+    console.log(row);
+  }
+
+  function makeRow(): string {
+    return " ".repeat(rowWidth);
+  }
+
+  function renderHeader(): void {
+    let row = makeRow();
+    row = writeDimAt(row, 0, "TIME".padEnd(timeColWidth));
+    for (let i = 0; i < visibleAgents.length; i++) {
+      row = writeDimAt(row, colStart(i), displayName(visibleAgents[i]).padEnd(agentColWidth));
+    }
+    flushRow(row);
+    console.log(DIM("─".repeat(rowWidth)));
+  }
+
+  const statusMap: Record<string, string> = {};
+  for (const a of allAgents) statusMap[a] = "ready";
+
+  const filtered = htmlEvents.filter((e) => e.type === "status" || e.type === "message");
+  let lastTsFormatted = "\n"; // won't match any fmtTime output
+
+  function sameTs(ts: string): boolean {
+    const t = fmtTime(ts);
+    return lastTsFormatted !== "\n" && t === lastTsFormatted;
+  }
+
+  renderHeader();
+
+  for (const ev of filtered) {
+    if (ev.type === "status") {
+      const name = ev.memberName ?? ev.sender;
+      const lastWord = ev.content?.split(" ").pop() ?? ev.status ?? "ready";
+      statusMap[name] = lastWord;
+      const agentIdx = allAgents.indexOf(name);
+      if (agentIdx >= maxAgents) continue;
+      const timeStr = sameTs(ev.timestamp) ? "─".repeat(timeColWidth) : fmtTime(ev.timestamp);
+      if (!sameTs(ev.timestamp)) lastTsFormatted = fmtTime(ev.timestamp);
+
+      let row = makeRow();
+      row = writeAt(row, 0, timeStr + " ");
+      const label = lastWord === "busy" ? DIM("[busy]") : DIM("[ready]");
+      row = writeAt(row, colStart(agentIdx), label);
+      flushRow(row);
+    }
+
+    if (ev.type === "message") {
+      const from = ev.sender === "__lead__" ? "__lead__" : (ev.sender && !ev.sender.startsWith("ses_") ? ev.sender : resolveSession(ev.senderId));
+      const mentions = ev.mentions ?? [];
+      const recipients = mentions.length > 0 ? mentions : allAgents.filter((a) => a !== from);
+      const content = (ev.content ?? "").split("\n")[0];
+
+      const fromIdx = allAgents.indexOf(from);
+      const toIdxs = recipients
+        .map((r) => allAgents.indexOf(r))
+        .filter((idx) => idx >= 0 && idx < maxAgents && idx !== fromIdx);
+
+      if (fromIdx < 0 || fromIdx >= maxAgents) continue;
+
+      const timeStr = sameTs(ev.timestamp) ? "─".repeat(timeColWidth) : fmtTime(ev.timestamp);
+      if (!sameTs(ev.timestamp)) lastTsFormatted = fmtTime(ev.timestamp);
+
+      let row = makeRow();
+      row = writeAt(row, 0, timeStr + " ");
+
+      if (toIdxs.length === 0) continue;
+
+      const firstTo = toIdxs[0];
+      const toName = displayName(visibleAgents[firstTo]);
+
+      const arrowStr = "→" + toName;
+      row = writeDimAt(row, colStart(fromIdx), arrowStr);
+
+      const dashStart = colStart(fromIdx) + arrowStr.length;
+      const dashEnd = colStart(firstTo);
+      if (dashStart < dashEnd && dashStart < rowWidth) {
+        const dashLen = Math.min(dashEnd - dashStart, rowWidth - dashStart);
+        row = writeDimAt(row, dashStart, "─".repeat(dashLen));
+      }
+
+      const maxContent = agentColWidth - 3;
+      const contentStr = `"${content.slice(0, maxContent)}${content.length > maxContent ? "…" : ""}"`;
+      row = writeDimAt(row, colStart(firstTo), contentStr);
+
+      flushRow(row);
+    }
+  }
+
+  if (!follow) {
+    process.exit(0);
+  }
+}
+
 printHeader();
 
 let rendered = 0;
@@ -383,7 +932,6 @@ console.log();
 let evOffset = readFileSync(eventsPath).length;
 let dbgOffset = existsSync(debugPath) ? readFileSync(debugPath).length : 0;
 
-// Reload config periodically so new members are mapped correctly
 function reloadConfig() {
   if (!existsSync(configPath)) return;
   try {
