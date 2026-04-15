@@ -11,8 +11,8 @@
  *   --no-status      hide status-change events
  *   --no-system      hide system events (spawns, shutdowns)
  *   --since <time>   only show events after HH:MM or ISO timestamp
- *   --html           write swimlane report as team.html
- *   --open           auto-open HTML report in browser
+ *   --html           write swimlane report as report.html and open it
+ *   --no-open        skip auto-opening the browser
  *   --lanes          terminal swimlane view (best-effort)
  *
  * Defaults to the most recently modified team if no name given.
@@ -55,7 +55,7 @@ const showDebug = flags.has("--debug");
 const hideStatus = flags.has("--no-status");
 const hideSystem = flags.has("--no-system");
 const generateHtml = flags.has("--html");
-const autoOpen = flags.has("--open");
+const autoOpen = !flags.has("--no-open");
 const showLanes = flags.has("--lanes");
 
 const sinceIdx = args.findIndex((a) => a === "--since");
@@ -442,23 +442,43 @@ h1 { font-size: 18px; font-weight: 600; margin-bottom: 4px; color: #f8fafc; }
   }
 
   // One row per message/status event
-  const rowEvents = events.filter((e) => e.type === "message" || e.type === "status");
+  const rowEvents = [...events].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+
+  // Track each agent's current status so every cell can be colored accordingly
+  const agentStatus: Record<string, string> = {};
+  for (const a of allAgents) agentStatus[a] = "ready";
+
+  function cellBg(agent: string, overrideAlpha?: number): string {
+    const s = agentStatus[agent] ?? "ready";
+    if (s === "busy") return `rgba(239,68,68,${overrideAlpha ?? 0.15})`;
+    if (s === "ready") return `rgba(34,197,94,${overrideAlpha ?? 0.08})`;
+    if (s === "error") return `rgba(239,68,68,0.3)`;
+    if (s === "shutdown") return `rgba(100,116,139,0.1)`;
+    return "transparent";
+  }
 
   for (const ev of rowEvents) {
+    if (ev.type === "system") {
+      html += `<div class="sys-row"><span style="margin-right:8px;opacity:0.5">${esc(fmtT(ev.timestamp))}</span>${esc(ev.content)}</div>`;
+      continue;
+    }
+
     if (ev.type === "status") {
       const name = ev.memberName ?? ev.sender;
       const lastWord = ev.content?.split(" ").pop() ?? "ready";
-      const color = STATUS_COLORS[lastWord] ?? STATUS_COLORS.ready;
+      agentStatus[name] = lastWord; // update before rendering so the cell shows new status
       const agentIdx = allAgents.indexOf(name);
       if (agentIdx < 0) continue;
 
       html += `<div class="row">`;
       html += `<div class="time-cell">${esc(fmtT(ev.timestamp))}</div>`;
       for (let i = 0; i < allAgents.length; i++) {
+        const bg = cellBg(allAgents[i]);
         if (i === agentIdx) {
-          html += `<div class="agent-cell"><div class="status-bar" style="background:${color}"></div></div>`;
+          // Show the transition bar on top of the cell background
+          html += `<div class="agent-cell" style="background:${bg}"><div class="status-bar" style="background:${STATUS_COLORS[lastWord] ?? STATUS_COLORS.ready}"></div></div>`;
         } else {
-          html += `<div class="agent-cell"></div>`;
+          html += `<div class="agent-cell" style="background:${bg}"></div>`;
         }
       }
       html += `</div>`;
@@ -484,10 +504,11 @@ h1 { font-size: 18px; font-weight: 600; margin-bottom: 4px; color: #f8fafc; }
       const agent = allAgents[ci];
       const isFrom = ci === fromIdx;
       const isTo = toNames.includes(agent) && ci !== fromIdx;
+      const bg = cellBg(agent);
 
       if (isFrom) {
         const toLabel = toNames.map(esc).join(", ");
-        html += `<div class="agent-cell" style="background:rgba(6,182,212,0.08)">`;
+        html += `<div class="agent-cell" style="background:${bg};outline:1px solid ${fromColor}33">`;
         html += `<div class="msg-row" data-msg="${esc(content)}" data-from="${esc(from)}" data-to="${toLabel}" data-ts="${esc(fmtT(ev.timestamp))}">`;
         html += `<div class="msg-dot" style="background:${fromColor}"></div>`;
         if (firstToIdx > fromIdx) {
@@ -500,19 +521,14 @@ h1 { font-size: 18px; font-weight: 600; margin-bottom: 4px; color: #f8fafc; }
         html += `<div class="msg-text" title="${esc(content)}">${esc(short)}</div>`;
         html += `</div></div>`;
       } else if (isTo) {
-        html += `<div class="agent-cell" style="background:rgba(6,182,212,0.04)">`;
+        html += `<div class="agent-cell" style="background:${bg};outline:1px solid ${fromColor}22">`;
         html += `<div class="msg-recv">◀ ${esc(from === leadName ? "lead" : from)}</div>`;
         html += `</div>`;
       } else {
-        html += `<div class="agent-cell"></div>`;
+        html += `<div class="agent-cell" style="background:${bg}"></div>`;
       }
     }
     html += `</div>`;
-  }
-
-  // System events as full-width rows at the end (they don't map to a column)
-  for (const ev of events.filter((e) => e.type === "system")) {
-    html += `<div class="sys-row"><span style="color:#475569;margin-right:8px">${esc(fmtT(ev.timestamp))}</span>${esc(ev.content)}</div>`;
   }
 
   html += `
@@ -544,7 +560,7 @@ document.addEventListener('click', () => document.getElementById('tooltip').clas
 
   if (doOpen) {
     const openCmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
-    Bun.spawn([openCmd, outputPath], { stdio: "inherit" });
+    Bun.spawn([openCmd, outputPath]);
   }
 }
 
@@ -626,7 +642,7 @@ if (generateHtml) {
   writeReport();
   if (autoOpen) {
     const openCmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
-    Bun.spawn([openCmd, outputPath], { stdio: "inherit" });
+    Bun.spawn([openCmd, outputPath]);
   }
   console.log(`Written: ${outputPath}`);
   if (!follow) process.exit(0);
