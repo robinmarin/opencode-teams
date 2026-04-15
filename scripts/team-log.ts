@@ -331,18 +331,6 @@ function buildTimeline(evLines: string[], dbgLines: string[]): Timestamped[] {
 
 // ─── HTML report ─────────────────────────────────────────────────────────────
 
-interface HtmlEvent {
-  type: "system" | "status" | "message";
-  sender: string;
-  senderId: string;
-  content: string;
-  mentions?: string[];
-  status?: string;
-  memberName?: string;
-  id: string;
-  timestamp: string;
-}
-
 interface StatusSpan {
   member: string;
   status: "busy" | "ready" | "retrying" | "error" | "shutdown";
@@ -352,7 +340,7 @@ interface StatusSpan {
 
 function generateHtmlReport(
   teamName: string,
-  events: HtmlEvent[],
+  events: Event[],
   members: string[],
   leadName: string,
   outputPath: string,
@@ -361,115 +349,81 @@ function generateHtmlReport(
 ): void {
   const allAgents = [leadName, ...members];
 
-  const statusSpans: StatusSpan[] = [];
-  const memberLastStatus: Record<string, { status: string; ts: string }> = {};
-
-  for (const ev of events) {
-    if (ev.type === "status") {
-      const name = ev.memberName ?? ev.sender;
-      const lastWord = ev.content?.split(" ").pop() ?? ev.status ?? "ready";
-      let status: StatusSpan["status"] = "ready";
-      if (lastWord === "busy") status = "busy";
-      else if (lastWord === "retrying") status = "retrying";
-      else if (lastWord === "shutdown") status = "shutdown";
-      else if (lastWord === "error") status = "error";
-
-      if (memberLastStatus[name]) {
-        const prev = memberLastStatus[name];
-        statusSpans.push({ member: name, status: prev.status as StatusSpan["status"], from: prev.ts, to: ev.timestamp });
-      }
-      memberLastStatus[name] = { status, ts: ev.timestamp };
-    }
-  }
-
-  for (const m of allAgents) {
-    if (!memberLastStatus[m]) {
-      memberLastStatus[m] = { status: "ready", ts: events[0]?.timestamp ?? new Date().toISOString() };
-    }
-  }
-
-  const messages = events.filter((e) => e.type === "message");
-  const sysEvents = events.filter((e) => e.type === "system");
-
   const esc = (s: string) =>
     s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
-  const fmtTime = (iso: string) => iso.slice(11, 19);
+  const fmtT = (iso: string) => iso.slice(11, 19);
 
   const STATUS_COLORS: Record<string, string> = {
-    busy: "#f59e0b",
-    ready: "#22c55e",
-    retrying: "#a855f7",
-    error: "#ef4444",
-    shutdown: "#6b7280",
+    busy: "#f59e0b", ready: "#22c55e", retrying: "#a855f7",
+    error: "#ef4444", shutdown: "#6b7280",
   };
 
   const AGENT_COLORS = [
-    "#06b6d4", "#eab308", "#22c55e", "#a855f7", "#3b82f6", "#ef4444", "#f97316", "#ec4899",
+    "#06b6d4", "#eab308", "#22c55e", "#a855f7",
+    "#3b82f6", "#ef4444", "#f97316", "#ec4899",
   ];
 
   const agentColorMap = new Map<string, string>();
   allAgents.forEach((a, i) => agentColorMap.set(a, AGENT_COLORS[i % AGENT_COLORS.length]));
 
+  function statusAt(member: string, ts: string): string {
+    const prior = events.filter(
+      (e) => e.type === "status" && e.timestamp <= ts && (e.memberName ?? e.sender) === member
+    );
+    if (!prior.length) return "ready";
+    const last = prior[prior.length - 1];
+    return last.content?.split(" ").pop() ?? last.status ?? "ready";
+  }
+
   const memberColWidth = 160;
   const timeColWidth = 80;
-  const colWidth = memberColWidth;
-  const totalWidth = timeColWidth + allAgents.length * colWidth + 20;
 
   let html = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Team: ${esc(teamName)} — Timeline Report</title>`;
+<title>Team: ${esc(teamName)}</title>`;
 
-  if (doFollow) {
-    html += `\n<meta http-equiv="refresh" content="2">`;
-  }
+  if (doFollow) html += `\n<meta http-equiv="refresh" content="2">`;
 
   html += `
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
-.container { max-width: 100vw; overflow-x: auto; padding: 16px; }
-h1 { font-size: 18px; font-weight: 600; margin-bottom: 12px; color: #f8fafc; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #e2e8f0; }
+.container { overflow-x: auto; padding: 16px; }
+h1 { font-size: 18px; font-weight: 600; margin-bottom: 4px; color: #f8fafc; }
 .meta { font-size: 12px; color: #64748b; margin-bottom: 16px; }
-.chart { display: grid; grid-template-columns: ${timeColWidth}px ${allAgents.map(() => colWidth + "px").join(" ")}; border: 1px solid #1e293b; border-radius: 6px; overflow: hidden; font-size: 12px; }
-.header-cell { background: #1e293b; padding: 8px 6px; font-weight: 600; text-align: center; border-bottom: 1px solid #334155; position: sticky; top: 0; z-index: 10; }
-.header-cell.lead { color: #22d3ee; }
-.time-cell { background: #1e293b; color: #64748b; padding: 4px 6px; border-right: 1px solid #334155; display: flex; align-items: center; font-size: 11px; }
-.agent-cell { border-right: 1px solid #1e293b; position: relative; min-height: 40px; }
+.chart { display: grid; grid-template-columns: ${timeColWidth}px ${allAgents.map(() => memberColWidth + "px").join(" ")}; border: 1px solid #1e293b; border-radius: 6px; overflow: hidden; font-size: 12px; }
+.header-cell { background: #1e293b; padding: 8px 6px; font-weight: 600; text-align: center; border-bottom: 1px solid #334155; position: sticky; top: 0; z-index: 10; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.time-cell { background: #161e2e; color: #64748b; padding: 4px 6px; border-right: 1px solid #1e293b; display: flex; align-items: center; font-size: 11px; white-space: nowrap; }
+.agent-cell { border-right: 1px solid #1e293b; position: relative; min-height: 32px; }
 .row { display: contents; }
-.row:hover .time-cell { background: #1e3a5f; }
-.row:hover .agent-cell { background: #1a2744; }
-.status-bar { position: absolute; top: 2px; left: 0; right: 0; height: 6px; border-radius: 3px; }
-.status-bar.busy { background: #f59e0b; }
-.status-bar.ready { background: #22c55e; }
-.status-bar.retrying { background: #a855f7; }
-.status-bar.error { background: #ef4444; }
-.status-bar.shutdown { background: #6b7280; }
-.msg-row { display: flex; align-items: center; height: 36px; padding: 2px 4px; cursor: pointer; }
-.msg-row:hover { background: #1e3a5f; border-radius: 4px; }
-.msg-arrow { flex: 1; display: flex; align-items: center; overflow: hidden; height: 100%; }
-.arrow-line { height: 2px; flex: 1; }
-.arrow-head { width: 0; height: 0; border-top: 5px solid transparent; border-bottom: 5px solid transparent; border-left: 8px solid currentColor; }
-.msg-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; margin: 0 4px; }
-.msg-text { margin-left: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 120px; color: #94a3b8; }
-.tooltip { position: fixed; background: #1e293b; border: 1px solid #334155; border-radius: 6px; padding: 10px 14px; font-size: 13px; max-width: 400px; z-index: 100; display: none; box-shadow: 0 10px 40px rgba(0,0,0,0.5); }
+.row:hover .time-cell, .row:hover .agent-cell { background: rgba(255,255,255,0.03); }
+.status-bar { position: absolute; top: 2px; left: 0; right: 0; height: 4px; border-radius: 2px; }
+.msg-row { display: flex; align-items: center; height: 32px; padding: 2px 6px; cursor: pointer; gap: 4px; }
+.msg-row:hover { background: rgba(255,255,255,0.06); border-radius: 4px; }
+.msg-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.arrow-line { height: 1px; flex: 1; opacity: 0.5; }
+.arrow-head { flex-shrink: 0; opacity: 0.7; }
+.msg-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 110px; color: #94a3b8; font-size: 11px; }
+.msg-recv { color: #64748b; font-size: 11px; padding: 0 6px; }
+.sys-row { grid-column: 1 / -1; padding: 3px 8px; color: #475569; font-style: italic; font-size: 11px; display: block; border-top: 1px solid #1e293b; }
+.tooltip { position: fixed; background: #1e293b; border: 1px solid #334155; border-radius: 6px; padding: 10px 14px; font-size: 13px; max-width: 440px; z-index: 100; display: none; box-shadow: 0 10px 40px rgba(0,0,0,0.6); }
 .tooltip.show { display: block; }
-.tooltip pre { white-space: pre-wrap; word-break: break-word; margin-top: 6px; color: #cbd5e1; }
-.tooltip .msg-header { font-weight: 600; color: #e2e8f0; }
-.tooltip .msg-time { font-size: 11px; color: #64748b; margin-bottom: 4px; }
-.legend { display: flex; gap: 16px; margin-bottom: 12px; font-size: 12px; }
+.tooltip pre { white-space: pre-wrap; word-break: break-word; margin-top: 6px; color: #cbd5e1; line-height: 1.5; }
+.tooltip .hdr { font-weight: 600; color: #e2e8f0; }
+.tooltip .ts { font-size: 11px; color: #64748b; margin-bottom: 4px; }
+.legend { display: flex; gap: 16px; margin-bottom: 12px; font-size: 12px; flex-wrap: wrap; }
 .legend-item { display: flex; align-items: center; gap: 6px; }
-.legend-dot { width: 10px; height: 10px; border-radius: 50%; }
-.sys-row { grid-column: 1 / -1; padding: 4px 8px; color: #475569; font-style: italic; font-size: 11px; }
+.legend-dot { width: 9px; height: 9px; border-radius: 50%; }
 </style>
 </head>
 <body>
 <div class="container">
 <h1>Team: ${esc(teamName)}</h1>
-<div class="meta">${events.length} events · ${allAgents.length} agents · ${outputPath}</div>
+<div class="meta">${events.length} events · ${allAgents.length} agents · ${esc(outputPath)}</div>
 <div class="legend">
   <div class="legend-item"><div class="legend-dot" style="background:#22c55e"></div>ready</div>
   <div class="legend-item"><div class="legend-dot" style="background:#f59e0b"></div>busy</div>
@@ -479,113 +433,86 @@ h1 { font-size: 18px; font-weight: 600; margin-bottom: 12px; color: #f8fafc; }
 </div>
 <div class="chart" id="chart">`;
 
-  html += `<div class="header-cell">Time</div>`;
+  // Header row
+  html += `<div class="header-cell" style="color:#64748b">Time</div>`;
   for (const agent of allAgents) {
+    const color = agentColorMap.get(agent) ?? "#06b6d4";
     const isLead = agent === leadName;
-    html += `<div class="header-cell${isLead ? " lead" : ""}">${esc(agent)}${isLead ? " ★" : ""}</div>`;
+    html += `<div class="header-cell" style="color:${color}">${esc(isLead ? "lead ★" : agent)}</div>`;
   }
 
-  const statusAtTs: Record<string, Record<string, StatusSpan["status"]>> = {};
-  const openSpans: Record<string, StatusSpan> = {};
+  // One row per message/status event
+  const rowEvents = events.filter((e) => e.type === "message" || e.type === "status");
 
-  function getStatusAt(member: string, ts: string): StatusSpan["status"] {
-    if (statusAtTs[ts]?.[member]) return statusAtTs[ts][member];
-    const sorted = events.filter((e) => e.timestamp <= ts && e.type === "status");
-    const lastStatus = sorted.filter((e) => (e.memberName ?? e.sender) === member).slice(-1)[0];
-    const lastWord = lastStatus?.content?.split(" ").pop() ?? lastStatus?.status ?? "ready";
-    if (lastWord === "busy") return "busy";
-    if (lastWord === "retrying") return "retrying";
-    if (lastWord === "shutdown") return "shutdown";
-    if (lastWord === "error") return "error";
-    return "ready";
-  }
+  for (const ev of rowEvents) {
+    if (ev.type === "status") {
+      const name = ev.memberName ?? ev.sender;
+      const lastWord = ev.content?.split(" ").pop() ?? "ready";
+      const color = STATUS_COLORS[lastWord] ?? STATUS_COLORS.ready;
+      const agentIdx = allAgents.indexOf(name);
+      if (agentIdx < 0) continue;
 
-  const timelineEvents = events.filter((e) => e.type === "message" || e.type === "system");
-  const firstTs = events[0]?.timestamp ?? new Date().toISOString();
-  const lastTs = events[events.length - 1]?.timestamp ?? new Date().toISOString();
-
-  const stepMs = 60000;
-  let curTs = firstTs.slice(0, 14) + "00:00.000Z";
-  while (curTs <= lastTs) {
-    const rowTime = curTs.slice(11, 19);
-    const rowIso = curTs;
-
-    html += `<div class="row">`;
-    html += `<div class="time-cell">${esc(rowTime)}</div>`;
-
-    for (const agent of allAgents) {
-      const st = getStatusAt(agent, rowIso);
-      const color = STATUS_COLORS[st] ?? "#22c55e";
-      html += `<div class="agent-cell">
-        <div class="status-bar ${esc(st)}" style="background:${color}"></div>
-      </div>`;
+      html += `<div class="row">`;
+      html += `<div class="time-cell">${esc(fmtT(ev.timestamp))}</div>`;
+      for (let i = 0; i < allAgents.length; i++) {
+        if (i === agentIdx) {
+          html += `<div class="agent-cell"><div class="status-bar" style="background:${color}"></div></div>`;
+        } else {
+          html += `<div class="agent-cell"></div>`;
+        }
+      }
+      html += `</div>`;
+      continue;
     }
 
-    html += `</div>`;
-    curTs = new Date(new Date(curTs).getTime() + stepMs).toISOString();
-  }
-
-  const msgEvents = events.filter((e) => e.type === "message");
-  for (const ev of msgEvents) {
-    const from = ev.sender === "__lead__" ? leadName : (ev.sender && !ev.sender.startsWith("ses_") ? ev.sender : resolveSession(ev.senderId));
+    // message
+    const from = ev.sender === "__lead__"
+      ? leadName
+      : (ev.sender && !ev.sender.startsWith("ses_") ? ev.sender : (sessionMap.get(ev.senderId) ?? leadName));
     const mentions = ev.mentions ?? [];
-    const toNames = mentions.length > 0
-      ? mentions.map((m) => (m === "__lead__" ? leadName : m))
-      : allAgents;
+    const toNames = mentions.length > 0 ? mentions.map((m) => m === "__lead__" ? leadName : m) : allAgents;
     const content = ev.content ?? "";
     const short = content.split("\n")[0].slice(0, 40);
-    const fullEsc = esc(content);
-    const shortEsc = esc(short);
-    const timeEsc = esc(fmtTime(ev.timestamp));
     const fromColor = agentColorMap.get(from) ?? "#06b6d4";
-    const toColor = toNames[0] ? (agentColorMap.get(toNames[0]) ?? "#06b6d4") : fromColor;
     const fromIdx = allAgents.indexOf(from);
-    const firstToIdx = toNames[0] ? allAgents.indexOf(toNames[0]) : 0;
-    const arrowDir = firstToIdx >= fromIdx ? "right" : "left";
+    const firstToIdx = toNames[0] ? allAgents.indexOf(toNames[0]) : -1;
 
     html += `<div class="row">`;
-    html += `<div class="time-cell">${timeEsc}</div>`;
+    html += `<div class="time-cell">${esc(fmtT(ev.timestamp))}</div>`;
 
     for (let ci = 0; ci < allAgents.length; ci++) {
       const agent = allAgents[ci];
       const isFrom = ci === fromIdx;
-      const isTo = toNames.includes(agent);
-      const cellBg = isFrom ? "background:#1e3a5f;border-radius:4px;margin:2px 0;" : "";
-
-      html += `<div class="agent-cell" style="${cellBg}">`;
+      const isTo = toNames.includes(agent) && ci !== fromIdx;
 
       if (isFrom) {
-        html += `<div class="msg-row" data-msg="${esc(fullEsc)}" data-from="${esc(from)}" data-to="${toNames.map(esc).join(", ")}">`;
-        html += `<div class="msg-arrow" style="color:${fromColor}">`;
+        const toLabel = toNames.map(esc).join(", ");
+        html += `<div class="agent-cell" style="background:rgba(6,182,212,0.08)">`;
+        html += `<div class="msg-row" data-msg="${esc(content)}" data-from="${esc(from)}" data-to="${toLabel}" data-ts="${esc(fmtT(ev.timestamp))}">`;
         html += `<div class="msg-dot" style="background:${fromColor}"></div>`;
-        html += `<div class="arrow-line" style="background:${fromColor}"></div>`;
-        if (arrowDir === "right") {
-          html += `<div class="arrow-head" style="border-left-color:${fromColor}"></div>`;
+        if (firstToIdx > fromIdx) {
+          html += `<div class="arrow-line" style="background:${fromColor}"></div>`;
+          html += `<div class="arrow-head" style="color:${fromColor}">▶</div>`;
+        } else if (firstToIdx < fromIdx && firstToIdx >= 0) {
+          html += `<div class="arrow-head" style="color:${fromColor}">◀</div>`;
+          html += `<div class="arrow-line" style="background:${fromColor}"></div>`;
         }
-        html += `</div>`;
-        html += `<div class="msg-text" title="${esc(content)}">${shortEsc}</div>`;
-        html += `</div>`;
+        html += `<div class="msg-text" title="${esc(content)}">${esc(short)}</div>`;
+        html += `</div></div>`;
       } else if (isTo) {
-        html += `<div class="msg-row">`;
-        html += `<div class="msg-arrow" style="color:${toColor}">`;
-        if (arrowDir === "left") {
-          html += `<div class="arrow-head" style="border-left-color:${toColor};transform:rotate(180deg)"></div>`;
-        }
-        html += `<div class="arrow-line" style="background:${toColor}"></div>`;
-        html += `<div class="msg-dot" style="background:${toColor}"></div>`;
+        html += `<div class="agent-cell" style="background:rgba(6,182,212,0.04)">`;
+        html += `<div class="msg-recv">◀ ${esc(from === leadName ? "lead" : from)}</div>`;
         html += `</div>`;
-        html += `<div class="msg-text">${shortEsc}</div>`;
-        html += `</div>`;
+      } else {
+        html += `<div class="agent-cell"></div>`;
       }
-
-      html += `</div>`;
     }
-
     html += `</div>`;
   }
 
-  for (const ev of sysEvents) {
-    html += `<div class="row sys-row"><div class="time-cell">${esc(fmtTime(ev.timestamp))}</div><div>${esc(ev.content)}</div></div>`;
+  // System events as full-width rows at the end (they don't map to a column)
+  for (const ev of events.filter((e) => e.type === "system")) {
+    html += `<div class="sys-row"><span style="color:#475569;margin-right:8px">${esc(fmtT(ev.timestamp))}</span>${esc(ev.content)}</div>`;
   }
 
   html += `
@@ -593,22 +520,21 @@ h1 { font-size: 18px; font-weight: 600; margin-bottom: 12px; color: #f8fafc; }
 <div class="tooltip" id="tooltip"></div>
 <script>
 document.querySelectorAll('.msg-row[data-msg]').forEach(el => {
-  el.addEventListener('click', (e) => {
+  el.addEventListener('click', e => {
     const tip = document.getElementById('tooltip');
-    const msg = el.getAttribute('data-msg') ?? '';
-    const from = el.getAttribute('data-from') ?? '';
-    const to = el.getAttribute('data-to') ?? '';
-    tip.innerHTML = '<div class="msg-time">' + from + ' → ' + to + '</div><pre>' + msg + '</pre>';
+    const from = el.getAttribute('data-from') || '';
+    const to = el.getAttribute('data-to') || '';
+    const ts = el.getAttribute('data-ts') || '';
+    const msg = el.getAttribute('data-msg') || '';
+    tip.innerHTML = '<div class="ts">' + ts + '</div><div class="hdr">' + from + ' → ' + to + '</div><pre>' + msg.replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</pre>';
     tip.classList.add('show');
     const rect = el.getBoundingClientRect();
-    tip.style.left = Math.min(rect.left, window.innerWidth - 420) + 'px';
-    tip.style.top = (rect.bottom + 8) + 'px';
+    tip.style.left = Math.min(rect.left, window.innerWidth - 460) + 'px';
+    tip.style.top = Math.min(rect.bottom + 8, window.innerHeight - 200) + 'px';
     e.stopPropagation();
   });
 });
-document.addEventListener('click', () => {
-  document.getElementById('tooltip').classList.remove('show');
-});
+document.addEventListener('click', () => document.getElementById('tooltip').classList.remove('show'));
 </script>
 </div>
 </body>
@@ -622,7 +548,37 @@ document.addEventListener('click', () => {
   }
 }
 
-// ─── Header ───────────────────────────────────────────────────────────────────
+// ─── ANSI-safe width helpers ──────────────────────────────────────────────────
+
+function visLen(s: string): number {
+  return s.replace(/\x1b\[[0-9;]*m/g, "").length;
+}
+
+function padToVis(s: string, n: number): string {
+  const vl = visLen(s);
+  return vl < n ? s + " ".repeat(n - vl) : s;
+}
+
+// ─── Config reload + file-tail helper (shared by all follow modes) ────────────
+
+function reloadConfig() {
+  if (!existsSync(configPath)) return;
+  try {
+    config = JSON.parse(readFileSync(configPath, "utf8")) as TeamConfig;
+    sessionMap = buildSessionMap(config);
+    bootstrapSessionMapFromEvents(sessionMap);
+  } catch {}
+}
+
+function checkFileBytes(path: string, offset: number): [string[], number] {
+  if (!existsSync(path)) return [[], offset];
+  const buf = readFileSync(path);
+  if (buf.length <= offset) return [[], offset];
+  const lines = buf.slice(offset).toString("utf8").split("\n").filter(Boolean);
+  return [lines, buf.length];
+}
+
+// ─── Header (linear mode) ─────────────────────────────────────────────────────
 
 function printHeader() {
   const members = config ? Object.keys(config.members) : [];
@@ -638,11 +594,7 @@ function printHeader() {
       .join("   ");
     console.log(`  ${roster}`);
   }
-  console.log(
-    DIM(
-      `  ${eventsPath}${follow ? "  (following)" : ""}${showDebug ? "  +debug" : ""}`
-    )
-  );
+  console.log(DIM(`  ${eventsPath}${follow ? "  (following)" : ""}${showDebug ? "  +debug" : ""}`));
   console.log(DIM("  ─".repeat(40)));
   console.log();
 }
@@ -651,318 +603,192 @@ function printHeader() {
 
 const evLines = readLines(eventsPath);
 const dbgLines = showDebug ? readLines(debugPath) : [];
-const timeline = buildTimeline(evLines, dbgLines);
+
+function parseEvents(lines: string[]): Event[] {
+  const out: Event[] = [];
+  for (const line of lines) {
+    try { out.push(JSON.parse(line) as Event); } catch {}
+  }
+  return out;
+}
+
+// ── HTML mode ─────────────────────────────────────────────────────────────────
 
 if (generateHtml) {
-  const htmlEvents: HtmlEvent[] = [];
-  for (const line of evLines) {
-    try { htmlEvents.push(JSON.parse(line) as HtmlEvent); } catch {}
-  }
-
-  const memberNames = config ? Object.keys(config.members) : [];
-  const leadName = "__lead__";
   const outputPath = join(teamDir, "report.html");
-  generateHtmlReport(teamName, htmlEvents, memberNames, leadName, outputPath, autoOpen, follow);
+  const memberNames = config ? Object.keys(config.members) : [];
 
-  if (!follow) {
-    process.exit(0);
+  function writeReport() {
+    const events = parseEvents(readLines(eventsPath));
+    generateHtmlReport(teamName, events, memberNames, "__lead__", outputPath, false, follow);
   }
+
+  writeReport();
+  if (autoOpen) {
+    const openCmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+    Bun.spawn([openCmd, outputPath], { stdio: "inherit" });
+  }
+  console.log(`Written: ${outputPath}`);
+  if (!follow) process.exit(0);
+
+  // Follow: regenerate the file when new events arrive
+  let evOff = readFileSync(eventsPath).length;
+  setInterval(() => {
+    reloadConfig();
+    const [, newOff] = checkFileBytes(eventsPath, evOff);
+    if (newOff > evOff) {
+      evOff = newOff;
+      writeReport();
+    }
+  }, 1000);
 }
 
-if (showLanes) {
-  const htmlEvents: HtmlEvent[] = [];
-  for (const line of evLines) {
-    try { htmlEvents.push(JSON.parse(line) as HtmlEvent); } catch {}
-  }
+// ── Lanes mode ────────────────────────────────────────────────────────────────
+
+else if (showLanes) {
   const memberNames = config ? Object.keys(config.members) : [];
   const allAgents = ["__lead__", ...memberNames];
 
-  function displayName(name: string): string {
+  function dispName(name: string): string {
     return name === "__lead__" ? "lead" : name;
   }
 
   const termWidth = (process.stdout as { columns?: number }).columns ?? 200;
-  const timeColWidth = 9;
-  const maxAgentName = allAgents.reduce((m, a) => Math.max(m, displayName(a).length), 0);
-  const agentColWidth = Math.max(10, maxAgentName + 2);
-  const maxAgents = Math.min(allAgents.length, Math.floor((termWidth - timeColWidth - 1) / agentColWidth));
-  const visibleAgents = allAgents.slice(0, maxAgents);
+  const TIME_W = 9;
+  const colW = Math.max(12, allAgents.reduce((m, a) => Math.max(m, dispName(a).length), 0) + 2);
+  const maxAgents = Math.min(allAgents.length, Math.floor((termWidth - TIME_W - 1) / colW));
+  const visAgents = allAgents.slice(0, maxAgents);
   const hiddenCount = allAgents.length - maxAgents;
 
-  function colStart(colIdx: number): number {
-    return timeColWidth + 1 + colIdx * agentColWidth;
+  function printLanesHeader(): void {
+    const t = padToVis(DIM("TIME"), TIME_W) + " ";
+    const cols = visAgents.map((a) => padToVis(paint(a, dispName(a)), colW)).join("");
+    console.log(t + cols + (hiddenCount > 0 ? DIM(` +${hiddenCount} more`) : ""));
+    console.log(DIM("─".repeat(TIME_W + 1 + visAgents.length * colW)));
   }
 
-  function rowForTime(time: string): string {
-    return (time + " ").padEnd(timeColWidth + 1) + visibleAgents.map((_, i) => " ".repeat(agentColWidth)).join("");
-  }
+  // Each cell: plain text + optional ANSI color applied at render time,
+  // so padToVis always measures the correct visual width.
+  type Cell = { text: string; color?: string };
 
-  function renderHeader(): void {
-    const timeHdr = B("TIME".padEnd(timeColWidth)) + " ";
-    const agentsHdr = visibleAgents.map((a) => B(displayName(a).padEnd(agentColWidth))).join("");
-    console.log(timeHdr + agentsHdr + (hiddenCount > 0 ? DIM(` +${hiddenCount}`) : ""));
-    console.log(DIM("─".repeat(timeColWidth + 1 + visibleAgents.length * agentColWidth)));
-  }
-
-  const filtered = htmlEvents.filter((e) => e.type === "status" || e.type === "message");
-  let lastTsFormatted = "\n";
-
-  function sameTs(ts: string): boolean {
-    const t = fmtTime(ts);
-    return lastTsFormatted !== "\n" && t === lastTsFormatted;
-  }
-
-  renderHeader();
-
-  for (const ev of filtered) {
-    if (ev.type === "status") {
-      const name = ev.memberName ?? ev.sender;
-      const lastWord = ev.content?.split(" ").pop() ?? ev.status ?? "ready";
-      statusMap[name] = lastWord;
-      const agentIdx = allAgents.indexOf(name);
-      if (agentIdx >= maxAgents) continue;
-      const timeStr = sameTs(ev.timestamp) ? "─".repeat(timeColWidth) : fmtTime(ev.timestamp);
-      if (!sameTs(ev.timestamp)) lastTsFormatted = fmtTime(ev.timestamp);
-
-      let row = rowForTime(timeStr);
-      const label = lastWord === "busy" ? DIM("[busy]") : DIM("[ready]");
-      row = row.slice(0, colStart(agentIdx)) + label + row.slice(colStart(agentIdx) + label.length);
-      console.log(row + (hiddenCount > 0 ? DIM(` +${hiddenCount}`) : ""));
-    }
-
-    if (ev.type === "message") {
-      const from = ev.sender === "__lead__" ? "__lead__" : (ev.sender && !ev.sender.startsWith("ses_") ? ev.sender : resolveSession(ev.senderId));
-      const mentions = ev.mentions ?? [];
-      const recipients = mentions.length > 0 ? mentions : allAgents.filter((a) => a !== from);
-      const content = (ev.content ?? "").split("\n")[0];
-
-      const fromIdx = allAgents.indexOf(from);
-      const toIdxs = recipients
-        .map((r) => allAgents.indexOf(r))
-        .filter((idx) => idx >= 0 && idx < maxAgents && idx !== fromIdx);
-
-      if (fromIdx < 0 || fromIdx >= maxAgents) continue;
-      if (toIdxs.length === 0) continue;
-
-      const timeStr = sameTs(ev.timestamp) ? "─".repeat(timeColWidth) : fmtTime(ev.timestamp);
-      if (!sameTs(ev.timestamp)) lastTsFormatted = fmtTime(ev.timestamp);
-
-      let row = rowForTime(timeStr);
-      const firstTo = toIdxs[0];
-      const toName = displayName(visibleAgents[firstTo]);
-
-      const arrowStr = "→" + toName;
-      row = row.slice(0, colStart(fromIdx)) + arrowStr + row.slice(colStart(fromIdx) + arrowStr.length);
-
-      const dashStart = colStart(fromIdx) + arrowStr.length;
-      const dashEnd = colStart(firstTo);
-      const dashLen = Math.max(0, Math.min(dashEnd - dashStart, termWidth - dashStart));
-      if (dashLen > 0) {
-        row = row.slice(0, dashStart) + DIM("─".repeat(dashLen)) + row.slice(dashStart + dashLen);
-      }
-
-      const maxContent = agentColWidth - 3;
-      const contentStr = `"${content.slice(0, maxContent)}${content.length > maxContent ? "…" : ""}"`;
-      const contentStart = colStart(firstTo);
-      row = row.slice(0, contentStart) + DIM(contentStr) + row.slice(contentStart + contentStr.length);
-
-      console.log(row + (hiddenCount > 0 ? DIM(` +${hiddenCount}`) : ""));
-    }
-  }
-
-  if (!follow) {
-    process.exit(0);
-  }
-}
-  const memberNames = config ? Object.keys(config.members) : [];
-  const allAgents = ["__lead__", ...memberNames];
-
-  function displayName(name: string): string {
-    return name === "__lead__" ? "lead" : name;
-  }
-
-  const termWidth = (process.stdout as { columns?: number }).columns ?? 200;
-  const timeColWidth = 9;
-  const agentColWidth = Math.max(12, allAgents.reduce((m, a) => Math.max(m, displayName(a).length), 0) + 2);
-  const maxAgents = Math.min(allAgents.length, Math.floor((termWidth - timeColWidth - 1) / agentColWidth));
-  const visibleAgents = allAgents.slice(0, maxAgents);
-  const hiddenCount = allAgents.length - maxAgents;
-  const rowWidth = timeColWidth + 1 + maxAgents * agentColWidth;
-
-  function colStart(colIdx: number): number {
-    return timeColWidth + 1 + colIdx * agentColWidth;
-  }
-
-  function writeAt(row: string, start: number, s: string): string {
-    const before = row.slice(0, start);
-    const after = row.slice(start + s.length);
-    return before + s + after;
-  }
-
-  function writeDimAt(row: string, start: number, s: string): string {
-    const d = "\x1b[2m";
-    const r = "\x1b[0m";
-    const before = row.slice(0, start);
-    const after = row.slice(start + s.length);
-    return before + d + s + r + after;
-  }
-
-  function flushRow(row: string): void {
+  function flushLanesRow(timeStr: string, cells: Cell[]): void {
+    const t = padToVis(DIM(timeStr), TIME_W) + " ";
+    const parts = cells.map(({ text, color }) => {
+      const truncated = text.length > colW - 1 ? text.slice(0, colW - 2) + "…" : text;
+      const styled = color ? `${color}${truncated}${R}` : DIM(truncated);
+      return padToVis(styled, colW);
+    });
+    let row = t + parts.join("");
     if (hiddenCount > 0) row += DIM(` +${hiddenCount}`);
     console.log(row);
   }
 
-  function makeRow(): string {
-    return " ".repeat(rowWidth);
-  }
+  // Render a batch of events that share the same second.
+  // Status updates are merged into one row; messages each get their own row.
+  function renderSecond(sec: string, evs: Event[], firstInOutput: boolean): void {
+    const statusEvs = evs.filter((e) => e.type === "status" && afterSince(e.timestamp));
+    const msgEvs = evs.filter((e) => e.type === "message" && afterSince(e.timestamp));
 
-  function renderHeader(): void {
-    let row = makeRow();
-    row = writeDimAt(row, 0, "TIME".padEnd(timeColWidth));
-    for (let i = 0; i < visibleAgents.length; i++) {
-      row = writeDimAt(row, colStart(i), displayName(visibleAgents[i]).padEnd(agentColWidth));
-    }
-    flushRow(row);
-    console.log(DIM("─".repeat(rowWidth)));
-  }
-
-  const statusMap: Record<string, string> = {};
-  for (const a of allAgents) statusMap[a] = "ready";
-
-  const filtered = htmlEvents.filter((e) => e.type === "status" || e.type === "message");
-  let lastTsFormatted = "\n"; // won't match any fmtTime output
-
-  function sameTs(ts: string): boolean {
-    const t = fmtTime(ts);
-    return lastTsFormatted !== "\n" && t === lastTsFormatted;
-  }
-
-  renderHeader();
-
-  for (const ev of filtered) {
-    if (ev.type === "status") {
-      const name = ev.memberName ?? ev.sender;
-      const lastWord = ev.content?.split(" ").pop() ?? ev.status ?? "ready";
-      statusMap[name] = lastWord;
-      const agentIdx = allAgents.indexOf(name);
-      if (agentIdx >= maxAgents) continue;
-      const timeStr = sameTs(ev.timestamp) ? "─".repeat(timeColWidth) : fmtTime(ev.timestamp);
-      if (!sameTs(ev.timestamp)) lastTsFormatted = fmtTime(ev.timestamp);
-
-      let row = makeRow();
-      row = writeAt(row, 0, timeStr + " ");
-      const label = lastWord === "busy" ? DIM("[busy]") : DIM("[ready]");
-      row = writeAt(row, colStart(agentIdx), label);
-      flushRow(row);
+    // One combined row for all status changes this second
+    if (statusEvs.length > 0) {
+      const cells: Cell[] = visAgents.map(() => ({ text: "" }));
+      for (const ev of statusEvs) {
+        const name = ev.memberName ?? resolveSender(ev.sender, ev.senderId);
+        const idx = visAgents.indexOf(name);
+        if (idx < 0) continue;
+        const isBusy = ev.content?.split(" ").pop() === "busy";
+        cells[idx] = { text: isBusy ? "● busy" : "● ready", color: isBusy ? "\x1b[33m" : "\x1b[32m" };
+      }
+      flushLanesRow(sec, cells);
     }
 
-    if (ev.type === "message") {
-      const from = ev.sender === "__lead__" ? "__lead__" : (ev.sender && !ev.sender.startsWith("ses_") ? ev.sender : resolveSession(ev.senderId));
+    // One row per message (no bridge dashes — just arrow in from-cell, snippet in to-cell)
+    for (let i = 0; i < msgEvs.length; i++) {
+      const ev = msgEvs[i];
+      const timeStr = i === 0 && statusEvs.length === 0 ? sec : "─".repeat(TIME_W);
+      const from = resolveSender(ev.sender, ev.senderId);
       const mentions = ev.mentions ?? [];
-      const recipients = mentions.length > 0 ? mentions : allAgents.filter((a) => a !== from);
+      const recipients = mentions.length > 0 ? mentions : visAgents.filter((a) => a !== from);
       const content = (ev.content ?? "").split("\n")[0];
 
-      const fromIdx = allAgents.indexOf(from);
-      const toIdxs = recipients
-        .map((r) => allAgents.indexOf(r))
-        .filter((idx) => idx >= 0 && idx < maxAgents && idx !== fromIdx);
+      const fromIdx = visAgents.indexOf(from);
+      const toIdxs = recipients.map((r) => visAgents.indexOf(r)).filter((i) => i >= 0 && i !== fromIdx);
+      if (fromIdx < 0 || toIdxs.length === 0) continue;
 
-      if (fromIdx < 0 || fromIdx >= maxAgents) continue;
-
-      const timeStr = sameTs(ev.timestamp) ? "─".repeat(timeColWidth) : fmtTime(ev.timestamp);
-      if (!sameTs(ev.timestamp)) lastTsFormatted = fmtTime(ev.timestamp);
-
-      let row = makeRow();
-      row = writeAt(row, 0, timeStr + " ");
-
-      if (toIdxs.length === 0) continue;
-
-      const firstTo = toIdxs[0];
-      const toName = displayName(visibleAgents[firstTo]);
-
-      const arrowStr = "→" + toName;
-      row = writeDimAt(row, colStart(fromIdx), arrowStr);
-
-      const dashStart = colStart(fromIdx) + arrowStr.length;
-      const dashEnd = colStart(firstTo);
-      if (dashStart < dashEnd && dashStart < rowWidth) {
-        const dashLen = Math.min(dashEnd - dashStart, rowWidth - dashStart);
-        row = writeDimAt(row, dashStart, "─".repeat(dashLen));
+      const cells: Cell[] = visAgents.map(() => ({ text: "" }));
+      cells[fromIdx] = { text: "→" + toIdxs.map((i) => dispName(visAgents[i])).join(","), color: colorFor(from) };
+      const snip = colW - 3;
+      for (const ti of toIdxs) {
+        cells[ti] = { text: `"${content.slice(0, snip)}${content.length > snip ? "…" : ""}"` };
       }
-
-      const maxContent = agentColWidth - 3;
-      const contentStr = `"${content.slice(0, maxContent)}${content.length > maxContent ? "…" : ""}"`;
-      row = writeDimAt(row, colStart(firstTo), contentStr);
-
-      flushRow(row);
+      flushLanesRow(timeStr, cells);
     }
   }
 
-  if (!follow) {
-    process.exit(0);
+  function renderLanesBatch(events: Event[]): void {
+    // Group by second, preserving order
+    const bySecond = new Map<string, Event[]>();
+    for (const ev of events) {
+      const sec = fmtTime(ev.timestamp);
+      if (!bySecond.has(sec)) bySecond.set(sec, []);
+      bySecond.get(sec)!.push(ev);
+    }
+    let first = true;
+    for (const [sec, evs] of bySecond) {
+      renderSecond(sec, evs, first);
+      first = false;
+    }
   }
+
+  printLanesHeader();
+  renderLanesBatch(parseEvents(evLines).filter((e) => e.type === "status" || e.type === "message"));
+  if (!follow) process.exit(0);
+
+  let evOff = readFileSync(eventsPath).length;
+  setInterval(() => {
+    reloadConfig();
+    const [newLines, newOff] = checkFileBytes(eventsPath, evOff);
+    evOff = newOff;
+    const newEvs = newLines.flatMap((line) => {
+      try { return [JSON.parse(line) as Event]; } catch { return []; }
+    }).filter((e) => e.type === "status" || e.type === "message");
+    if (newEvs.length > 0) renderLanesBatch(newEvs);
+  }, 500);
 }
 
-printHeader();
+// ── Linear mode (default) ─────────────────────────────────────────────────────
 
-let rendered = 0;
-for (const item of timeline) {
-  const out = item.render();
-  if (out) {
-    console.log(out);
-    rendered++;
-  }
-}
+else {
+  const timeline = buildTimeline(evLines, dbgLines);
 
-if (rendered === 0) {
-  console.log(DIM("  (no events to show)"));
-}
+  printHeader();
 
-if (!follow) {
-  console.log();
-  process.exit(0);
-}
-
-// ─── Follow mode — tail both files ───────────────────────────────────────────
-
-console.log();
-console.log(DIM("  ── live ──"));
-console.log();
-
-let evOffset = readFileSync(eventsPath).length;
-let dbgOffset = existsSync(debugPath) ? readFileSync(debugPath).length : 0;
-
-function reloadConfig() {
-  if (!existsSync(configPath)) return;
-  try {
-    config = JSON.parse(readFileSync(configPath, "utf8")) as TeamConfig;
-    sessionMap = buildSessionMap(config);
-    bootstrapSessionMapFromEvents(sessionMap);
-  } catch {}
-}
-
-function checkFile(path: string, offset: number): [string[], number] {
-  if (!existsSync(path)) return [[], offset];
-  const buf = readFileSync(path);
-  if (buf.length <= offset) return [[], offset];
-  const newBytes = buf.slice(offset);
-  const lines = newBytes.toString("utf8").split("\n").filter(Boolean);
-  return [lines, buf.length];
-}
-
-function pollEvents() {
-  reloadConfig();
-  const [newEvLines, newEvOff] = checkFile(eventsPath, evOffset);
-  evOffset = newEvOff;
-
-  const [newDbgLines, newDbgOff] = checkFile(debugPath, dbgOffset);
-  dbgOffset = newDbgOff;
-
-  const newItems = buildTimeline(newEvLines, showDebug ? newDbgLines : []);
-  for (const item of newItems) {
+  let rendered = 0;
+  for (const item of timeline) {
     const out = item.render();
-    if (out) console.log(out);
+    if (out) { console.log(out); rendered++; }
   }
-}
 
-setInterval(pollEvents, 500);
+  if (rendered === 0) console.log(DIM("  (no events to show)"));
+  if (!follow) { console.log(); process.exit(0); }
+
+  console.log();
+  console.log(DIM("  ── live ──"));
+  console.log();
+
+  let evOff = readFileSync(eventsPath).length;
+  let dbgOff = existsSync(debugPath) ? readFileSync(debugPath).length : 0;
+
+  setInterval(() => {
+    reloadConfig();
+    const [newEvLines, newEvOff] = checkFileBytes(eventsPath, evOff);
+    evOff = newEvOff;
+    const [newDbgLines, newDbgOff] = checkFileBytes(debugPath, dbgOff);
+    dbgOff = newDbgOff;
+    const newItems = buildTimeline(newEvLines, showDebug ? newDbgLines : []);
+    for (const item of newItems) {
+      const out = item.render();
+      if (out) console.log(out);
+    }
+  }, 500);
+}
