@@ -893,18 +893,19 @@ function makeTools(
       taskId: z.string().describe("ID of the task to claim"),
     },
     async execute(args, context) {
-      const log = _getLogger(client, args.teamName);
-      log.debug("tool", "team_task_claim called", {
-        teamName: args.teamName,
-        taskId: args.taskId,
-        sessionId: context.sessionID,
-      });
+      const baseLog = _getLogger(client, args.teamName);
       try {
         const found = await findTeamBySession(context.sessionID);
         const memberName =
           found !== null && found.memberName !== LEAD_MEMBER_NAME
             ? found.memberName
             : context.sessionID;
+        const log = baseLog.child({ memberName });
+        log.debug("tool", "team_task_claim called", {
+          teamName: args.teamName,
+          taskId: args.taskId,
+          sessionId: context.sessionID,
+        });
 
         const result = await claimTask(args.teamName, args.taskId, memberName);
         if (!result.ok) {
@@ -929,7 +930,7 @@ function makeTools(
         });
         return `Task "${args.taskId}" claimed by "${memberName}" and is now in_progress.`;
       } catch (err) {
-        log.error("tool", "team_task_claim failed", {
+        baseLog.error("tool", "team_task_claim failed", {
           teamName: args.teamName,
           taskId: args.taskId,
           error: String(err),
@@ -1595,6 +1596,132 @@ function makeTools(
   });
 
   // ---------------------------------------------------------------------------
+  // team_member_session
+  // ---------------------------------------------------------------------------
+  const team_member_session = tool({
+    description:
+      "Read the raw conversation of a specific member's session: the prompts they received, their responses, and the tools they called. Use this to understand exactly what a member is doing or has done — their 'voice'.",
+    args: {
+      teamName: z.string().describe("Name of the team"),
+      memberName: z.string().describe("Name of the member to inspect"),
+      limit: z
+        .number()
+        .optional()
+        .default(20)
+        .describe("Number of most recent messages to show (default: 20)"),
+    },
+    async execute(args, _context) {
+      const log = _getLogger(client, args.teamName);
+      log.debug("tool", "team_member_session called", {
+        teamName: args.teamName,
+        memberName: args.memberName,
+        limit: args.limit,
+      });
+      try {
+        const team = await readTeam(args.teamName);
+        if (team === null) {
+          return `Error: Team "${args.teamName}" not found.`;
+        }
+
+        const member = team.members[args.memberName];
+        if (member === undefined) {
+          return `Error: Member "${args.memberName}" not found in team "${args.teamName}".`;
+        }
+
+        const result = await client.session.messages({
+          path: { id: member.sessionId },
+          query: { limit: 200 },
+        });
+
+        if (result.error !== undefined) {
+          log.error("tool", "team_member_session fetch failed", {
+            memberName: args.memberName,
+            error: JSON.stringify(result.error),
+          });
+          return `Error fetching session messages: ${JSON.stringify(result.error)}`;
+        }
+
+        const all = result.data;
+        const limit = args.limit ?? 20;
+        const selected = all.slice(-limit);
+
+        const header = [
+          `Member: ${args.memberName}  status: ${member.status}  session: ${member.sessionId}`,
+          `Showing ${selected.length} of ${all.length} messages`,
+          "",
+        ];
+
+        const TEXT_LIMIT = 600;
+        const TOOL_OUTPUT_LIMIT = 400;
+
+        const body: string[] = [];
+        for (const { info, parts } of selected) {
+          const ts = new Date(info.time.created).toISOString().slice(11, 19); // HH:MM:SS
+
+          if (info.role === "user") {
+            body.push(`── RECEIVED @ ${ts} ${"─".repeat(50)}`);
+            for (const p of parts) {
+              if (p.type !== "text") continue;
+              if (p.synthetic) continue; // skip system-injected markers
+              const text = p.text.length > TEXT_LIMIT
+                ? `${p.text.slice(0, TEXT_LIMIT)}…`
+                : p.text;
+              body.push(text);
+            }
+          } else {
+            body.push(`── ${args.memberName} @ ${ts} ${"─".repeat(50)}`);
+            // First, render any error on the assistant message
+            if (info.error !== undefined) {
+              body.push(`[ERROR] ${JSON.stringify(info.error)}`);
+            }
+            for (const p of parts) {
+              if (p.type === "text") {
+                if (p.synthetic) continue;
+                const text = p.text.length > TEXT_LIMIT
+                  ? `${p.text.slice(0, TEXT_LIMIT)}…`
+                  : p.text;
+                body.push(text);
+              } else if (p.type === "tool") {
+                const inputStr = JSON.stringify(p.state.input);
+                const truncInput =
+                  inputStr.length > 300 ? `${inputStr.slice(0, 300)}…` : inputStr;
+                if (p.state.status === "completed") {
+                  const out = p.state.output.length > TOOL_OUTPUT_LIMIT
+                    ? `${p.state.output.slice(0, TOOL_OUTPUT_LIMIT)}…`
+                    : p.state.output;
+                  body.push(`  [tool: ${p.tool}]`);
+                  body.push(`  in:  ${truncInput}`);
+                  body.push(`  out: ${out}`);
+                } else if (p.state.status === "error") {
+                  body.push(`  [tool: ${p.tool}] ERROR: ${p.state.error.slice(0, 200)}`);
+                } else {
+                  body.push(`  [tool: ${p.tool}] (${p.state.status})`);
+                }
+              }
+            }
+          }
+          body.push("");
+        }
+
+        log.info("tool", "team_member_session retrieved", {
+          memberName: args.memberName,
+          totalMessages: all.length,
+          shown: selected.length,
+        });
+        return [...header, ...body].join("\n");
+      } catch (err) {
+        log.error("tool", "team_member_session failed", {
+          teamName: args.teamName,
+          memberName: args.memberName,
+          error: String(err),
+        });
+        console.error("[team_member_session] error:", err);
+        return `Error reading member session: ${String(err)}`;
+      }
+    },
+  });
+
+  // ---------------------------------------------------------------------------
   // team_logs
   // ---------------------------------------------------------------------------
   const team_logs = tool({
@@ -1679,18 +1806,19 @@ function makeTools(
       body: z.string().describe("Full content of the post"),
     },
     async execute(args, context) {
-      const log = _getLogger(client, args.teamName);
-      log.debug("tool", "team_bulletin_post called", {
-        teamName: args.teamName,
-        category: args.category,
-        senderSessionId: context.sessionID,
-      });
+      const baseLog = _getLogger(client, args.teamName);
       try {
         const team = await readTeam(args.teamName);
         if (team === null) {
           return `Error: Team "${args.teamName}" not found.`;
         }
         const author = await resolveSenderName(context.sessionID);
+        const log = baseLog.child({ memberName: author });
+        log.debug("tool", "team_bulletin_post called", {
+          teamName: args.teamName,
+          category: args.category,
+          senderSessionId: context.sessionID,
+        });
         const post = await appendBulletinPost(args.teamName, {
           author,
           authorId: context.sessionID,
@@ -1705,7 +1833,7 @@ function makeTools(
         });
         return `Bulletin post created: ${post.id}`;
       } catch (err) {
-        log.error("tool", "team_bulletin_post failed", {
+        baseLog.error("tool", "team_bulletin_post failed", {
           teamName: args.teamName,
           error: String(err),
         });
@@ -1774,13 +1902,15 @@ function makeTools(
           "Total number of entries to show across all sources (default: 50)",
         ),
     },
-    async execute(args, _context) {
-      const log = _getLogger(client, args.teamName);
-      log.debug("tool", "team_timeline called", {
-        teamName: args.teamName,
-        limit: args.limit,
-      });
+    async execute(args, context) {
+      const baseLog = _getLogger(client, args.teamName);
       try {
+        const callerName = await resolveSenderName(context.sessionID);
+        const log = baseLog.child({ memberName: callerName });
+        log.debug("tool", "team_timeline called", {
+          teamName: args.teamName,
+          limit: args.limit,
+        });
         const team = await readTeam(args.teamName);
         if (team === null) {
           return `Error: Team "${args.teamName}" not found.`;
@@ -1836,7 +1966,7 @@ function makeTools(
 
         return [`Timeline for "${args.teamName}":`, ...selected.map((e) => e.line)].join("\n");
       } catch (err) {
-        log.error("tool", "team_timeline failed", {
+        baseLog.error("tool", "team_timeline failed", {
           teamName: args.teamName,
           error: String(err),
         });
@@ -1866,6 +1996,7 @@ function makeTools(
     team_task_list,
     team_task_update,
     team_member_info,
+    team_member_session,
     team_logs,
     team_bulletin_post,
     team_bulletin_read,
@@ -1877,11 +2008,18 @@ function makeTools(
 // Factory — call this at plugin init with the live client
 // ---------------------------------------------------------------------------
 
-const noOpLogger = {
-  debug: (_c: string, _m: string, _x?: Record<string, unknown>) => {},
-  info: (_c: string, _m: string, _x?: Record<string, unknown>) => {},
-  warn: (_c: string, _m: string, _x?: Record<string, unknown>) => {},
-  error: (_c: string, _m: string, _x?: Record<string, unknown>) => {},
+const noOpLogger: {
+  debug: (_c: string, _m: string, _x?: Record<string, unknown>) => void;
+  info: (_c: string, _m: string, _x?: Record<string, unknown>) => void;
+  warn: (_c: string, _m: string, _x?: Record<string, unknown>) => void;
+  error: (_c: string, _m: string, _x?: Record<string, unknown>) => void;
+  child: (_overrides: Record<string, unknown>) => typeof noOpLogger;
+} = {
+  debug: (_c, _m, _x) => {},
+  info: (_c, _m, _x) => {},
+  warn: (_c, _m, _x) => {},
+  error: (_c, _m, _x) => {},
+  child: (_overrides) => noOpLogger,
 };
 
 export function createTools(

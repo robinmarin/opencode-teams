@@ -3,6 +3,45 @@ import type { TeamConfig } from "./state.js";
 const ESC = "\x1b";
 const CSI = `${ESC}[`;
 
+export function truncate(text: string, maxWidth: number): string {
+  if (text.length <= maxWidth) return text;
+  return `${text.slice(0, maxWidth - 1)}…`;
+}
+
+function _ansiTrimTo(text: string, maxWidth: number): string {
+  if (text.length <= maxWidth) return text;
+  const available = maxWidth - 1;
+  const tokens: { start: number; end: number; raw: string }[] = [];
+  const raw = "\x1b";
+  const escSeq = `${raw}[`;
+  const closeSeq = "m";
+  let pos = 0;
+  while (pos < text.length) {
+    const escIdx = text.indexOf(escSeq, pos);
+    if (escIdx === -1 || escIdx >= available) break;
+    const closeIdx = text.indexOf(closeSeq, escIdx + 2);
+    if (closeIdx === -1) break;
+    tokens.push({
+      start: escIdx,
+      end: closeIdx + 1,
+      raw: text.slice(escIdx, closeIdx + 1),
+    });
+    pos = closeIdx + 1;
+  }
+  let lastEnd = 0;
+  let output = "";
+  for (const token of tokens) {
+    if (token.start < available) {
+      output += text.slice(lastEnd, token.start);
+      output += token.raw;
+      lastEnd = token.end;
+    }
+  }
+  output += text.slice(lastEnd, lastEnd + available);
+  output += "\x1b[0m";
+  return `${output}…`;
+}
+
 export const ansi = {
   save: () => `${CSI}s`,
   restore: () => `${CSI}u`,
@@ -67,6 +106,11 @@ function memberLine(
         ? ansi.fg(3)
         : ansi.fg(8);
   const tag = `${colorTag}[${stateTag.padEnd(8)}]${ansi.reset()}`;
+  const maxTaskLen = 30;
+  const truncatedTask =
+    currentTask.length > maxTaskLen
+      ? `${currentTask.slice(0, maxTaskLen - 1)}…`
+      : currentTask || "(no task)";
 
   return (
     `${ansi.cursorTo(idx + 1, 1)}` +
@@ -76,7 +120,7 @@ function memberLine(
     ` ${tag}` +
     ` ${padRole}` +
     `${ansi.dim()}│${ansi.reset()} ` +
-    `${currentTask || "(no task)"} ` +
+    `${truncatedTask} ` +
     `${ansi.dim()}${age}${ansi.reset()}` +
     `${ansi.restore()}`
   );
@@ -130,23 +174,42 @@ export function renderTeamStatus(team: TeamConfig, maxRows = 8): string {
  * Plain-text team status summary — safe to send to the model as prompt context.
  * No ANSI escape codes.
  */
-export function renderTeamStatusPlain(team: TeamConfig): string {
+export function renderTeamStatusPlain(
+  team: TeamConfig,
+  maxLines?: number,
+): string {
   const members = Object.values(team.members);
   if (members.length === 0) return `Team ${team.name}: no members`;
+  const limit = maxLines ?? members.length + 1;
   const lines = [
     `[Team ${team.name} — ${members.length} member${members.length !== 1 ? "s" : ""}]`,
   ];
-  for (const m of members) {
-    const age = formatAge(m.spawnedAt);
-    let statusStr: string = m.status;
-    if (m.status === "retrying" && m.retryAttempt !== undefined) {
-      const nextSec =
-        m.retryNextMs !== undefined
-          ? `, retry in ${Math.ceil(m.retryNextMs / 1000)}s`
-          : "";
-      statusStr = `retrying (attempt ${m.retryAttempt}${nextSec})`;
-    }
-    lines.push(`  ${m.name}: ${statusStr} (${age})`);
+  const busy = members.filter(
+    (m) => m.status === "busy" || m.status === "retrying",
+  );
+  const ready = members.filter((m) => m.status === "ready");
+  const err = members.filter((m) => m.status === "error");
+  const clipped = (s: string, max = 80) =>
+    s.length > max ? `${s.slice(0, max - 1)}…` : s;
+  if (busy.length > 0)
+    lines.push(
+      clipped(
+        `  ● ${busy.length} working: ${busy.map((m) => m.name).join(", ")}`,
+      ),
+    );
+  if (ready.length > 0)
+    lines.push(
+      clipped(
+        `  ○ ${ready.length} idle: ${ready.map((m) => m.name).join(", ")}`,
+      ),
+    );
+  if (err.length > 0)
+    lines.push(
+      clipped(`  ✗ ${err.length} error: ${err.map((m) => m.name).join(", ")}`),
+    );
+  if (lines.length > limit) {
+    lines.length = limit - 1;
+    lines.push(`  … and ${members.length - limit + 2} more`);
   }
   return lines.join("\n");
 }
