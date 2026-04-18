@@ -101,10 +101,6 @@ export function createEventHandler(
     const indexSize = sessionIndexSize();
     if (indexSize > 0 && !isKnownSession(sessionID)) return;
 
-    console.debug(
-      `[opencode-teams] event=${event.type} sessionID=${sessionID} indexSize=${indexSize}`,
-    );
-
     // Serialise all events for the same session through a per-session queue.
     // This prevents concurrent session.status(busy) and session.idle events
     // from racing each other and clobbering the "ready" status on disk.
