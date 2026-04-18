@@ -225,10 +225,11 @@ export async function updateMember(
     if (existing === undefined) {
       throw new Error(`Member "${memberName}" not found in team "${teamName}"`);
     }
-    if (patch.status !== undefined && patch.status !== existing.status) {
-      patch.lastStatusAt = new Date().toISOString();
-    }
-    const merged = { ...existing, ...patch } as TeamMember;
+    const effectivePatch =
+      patch.status !== undefined && patch.status !== existing.status
+        ? { ...patch, lastStatusAt: new Date().toISOString() }
+        : patch;
+    const merged = { ...existing, ...effectivePatch } as TeamMember;
     for (const key of clear ?? []) delete merged[key];
     config.members[memberName] = merged;
     const tmpPath = `${configPath}.tmp`;
@@ -602,7 +603,7 @@ export async function pruneEvents(
       return { pruned: 0, remaining: lines.length };
     }
 
-    const toKeep = lines.slice(-keep);
+    const toKeep = keep === 0 ? [] : lines.slice(-keep);
     const pruned = lines.length - keep;
 
     const tmpPath = `${eventsPath}.tmp`;

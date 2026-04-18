@@ -13,8 +13,10 @@ import {
   markStaleMembersAsError,
   pruneEvents,
   readBulletinPosts,
+  readDebugLogs,
   readTeam,
   setTestTeamsDir,
+  teamDir,
   updateMember,
   writeTeam,
 } from "../src/state.js";
@@ -489,5 +491,541 @@ describe("appendBulletinPost + readBulletinPosts", () => {
     expect(posts.length).toBe(2);
     expect(posts[0]?.category).toBe("blocker");
     expect(posts[1]?.category).toBe("question");
+  });
+});
+
+describe("updateMember patch mutation bug", () => {
+  it("does not mutate the caller's patch object across calls", async () => {
+    const team = makeTeam({
+      members: {
+        alice: {
+          name: "alice",
+          sessionId: "sess-alice",
+          status: "ready",
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: "2026-01-01T00:00:00.000Z",
+        },
+      },
+    });
+    await writeTeam(team);
+
+    const patch: { status: "busy" } = { status: "busy" };
+    await updateMember("test-team", "alice", patch);
+
+    const result1 = await readTeam("test-team");
+    expect(result1?.members["alice"]?.status).toBe("busy");
+
+    await updateMember("test-team", "alice", patch);
+
+    const result2 = await readTeam("test-team");
+    expect(result2?.members["alice"]?.status).toBe("busy");
+    expect(patch).not.toHaveProperty("lastStatusAt");
+  });
+});
+
+describe("claimTask ghost member", () => {
+  it("returns ok:true but does not write currentTask when assignee is not a member", async () => {
+    const team = makeTeam({
+      tasks: {
+        task_ghost: {
+          id: "task_ghost",
+          title: "Ghost Task",
+          description: "No such member",
+          status: "pending",
+          assignee: null,
+          dependsOn: [],
+          createdAt: new Date().toISOString(),
+        },
+      },
+    });
+    await writeTeam(team);
+
+    const result = await claimTask("test-team", "task_ghost", "ghost_member");
+    expect(result.ok).toBe(true);
+
+    const updated = await readTeam("test-team");
+    const ghostMember = updated?.members["ghost_member"];
+    expect(ghostMember).toBeUndefined();
+  });
+});
+
+describe("markStaleMembersAsError", () => {
+  it("marks retrying members as error and preserves previousStatus", async () => {
+    const team = makeTeam({
+      members: {
+        alice: {
+          name: "alice",
+          sessionId: "sess-alice",
+          status: "retrying",
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: new Date().toISOString(),
+        },
+      },
+    });
+    await writeTeam(team);
+
+    const recovered = await markStaleMembersAsError("test-team");
+    expect(recovered.length).toBe(1);
+    expect(recovered[0]?.memberName).toBe("alice");
+    expect(recovered[0]?.previousStatus).toBe("retrying");
+
+    const updated = await readTeam("test-team");
+    expect(updated?.members["alice"]?.status).toBe("error");
+  });
+});
+
+describe("updateMember clear param", () => {
+  it("removes specified fields from the stored member", async () => {
+    const team = makeTeam({
+      members: {
+        alice: {
+          name: "alice",
+          sessionId: "sess-alice",
+          status: "busy",
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: "2026-01-01T00:00:00.000Z",
+          retryAttempt: 5,
+          retryNextMs: 1000,
+        },
+      },
+    });
+    await writeTeam(team);
+
+    await updateMember(
+      "test-team",
+      "alice",
+      {},
+      ["retryAttempt", "retryNextMs"],
+    );
+
+    const result = await readTeam("test-team");
+    expect(result?.members["alice"]).not.toHaveProperty("retryAttempt");
+    expect(result?.members["alice"]).not.toHaveProperty("retryNextMs");
+  });
+});
+
+describe("corrupt JSON vs ENOENT", () => {
+  it("readBulletinPosts throws on malformed JSON", async () => {
+    const team = makeTeam({ name: "corrupt-bul-team" });
+    await writeTeam(team);
+    const bulPath = path.join(teamDir("corrupt-bul-team"), "bulletin.jsonl");
+    await fs.mkdir(teamDir("corrupt-bul-team"), { recursive: true });
+    await fs.writeFile(bulPath, '{"broken\n', "utf-8");
+
+    await expect(readBulletinPosts("corrupt-bul-team")).rejects.toThrow();
+  });
+
+  it("getEvents throws on malformed JSON", async () => {
+    const team = makeTeam({ name: "corrupt-evt-team" });
+    await writeTeam(team);
+    const evtPath = path.join(teamDir("corrupt-evt-team"), "events.jsonl");
+    await fs.mkdir(teamDir("corrupt-evt-team"), { recursive: true });
+    await fs.writeFile(evtPath, '{"broken\n', "utf-8");
+
+    await expect(getEvents("corrupt-evt-team", 10)).rejects.toThrow();
+  });
+});
+
+describe("findTeamBySession fast-path null after team deletion", () => {
+  it("returns null without throwing when team directory is removed externally", async () => {
+    const team = makeTeam({ name: "delete-me-team", leadSessionId: "sess-delete" });
+    await writeTeam(team);
+
+    await fs.rm(teamDir("delete-me-team"), { recursive: true, force: true });
+
+    const result = await findTeamBySession("sess-delete");
+    expect(result).toBeNull();
+  });
+});
+
+describe("readDebugLogs", () => {
+  it("reads and filters debug logs correctly", async () => {
+    const team = makeTeam({ name: "debug-log-team" });
+    await writeTeam(team);
+
+    const logDir = path.join(teamDir("debug-log-team"), "logs");
+    await fs.mkdir(logDir, { recursive: true });
+    const logPath = path.join(logDir, "debug.jsonl");
+
+    const entry1: string = JSON.stringify({
+      id: "log_1",
+      ts: "2026-01-01T00:00:00.000Z",
+      level: "info",
+      category: "status",
+      sessionId: "sess-alice",
+      teamName: "debug-log-team",
+      memberName: "alice",
+      correlationId: null,
+      message: "alice is ready",
+      context: {},
+    }) + "\n";
+
+    const entry2: string = JSON.stringify({
+      id: "log_2",
+      ts: "2026-01-01T00:01:00.000Z",
+      level: "error",
+      category: "status",
+      sessionId: "sess-bob",
+      teamName: "debug-log-team",
+      memberName: "bob",
+      correlationId: null,
+      message: "bob encountered an error",
+      context: {},
+    }) + "\n";
+
+    const entry3: string = JSON.stringify({
+      id: "log_3",
+      ts: "2026-01-01T00:02:00.000Z",
+      level: "info",
+      category: "status",
+      sessionId: "sess-alice",
+      teamName: "debug-log-team",
+      memberName: "alice",
+      correlationId: null,
+      message: "alice completed task",
+      context: {},
+    }) + "\n";
+
+    await fs.writeFile(logPath, entry1 + entry2 + entry3, "utf-8");
+
+    const { logs: all } = await readDebugLogs("debug-log-team", {});
+    expect(all.length).toBe(3);
+
+    const { logs: byLevel } = await readDebugLogs("debug-log-team", { level: "error" });
+    expect(byLevel.length).toBe(1);
+    expect(byLevel[0]?.level).toBe("error");
+
+    const { logs: bySessionId } = await readDebugLogs("debug-log-team", { sessionId: "sess-alice" });
+    expect(bySessionId.length).toBe(2);
+
+    const { logs: byMemberName } = await readDebugLogs("debug-log-team", { memberName: "bob" });
+    expect(byMemberName.length).toBe(1);
+    expect(byMemberName[0]?.memberName).toBe("bob");
+
+    const { logs: bySince } = await readDebugLogs("debug-log-team", { since: "2026-01-01T00:01:30.000Z" });
+    expect(bySince.length).toBe(1);
+    expect(bySince[0]?.id).toBe("log_3");
+
+    const { logs: byLimit } = await readDebugLogs("debug-log-team", { limit: 2 });
+    expect(byLimit.length).toBe(2);
+
+    const { logs: byLevelAndMember } = await readDebugLogs("debug-log-team", {
+      level: "info",
+      memberName: "alice",
+    });
+    expect(byLevelAndMember.length).toBe(2);
+  });
+
+  it("returns empty logs when file does not exist", async () => {
+    const team = makeTeam({ name: "no-log-team" });
+    await writeTeam(team);
+    const { logs } = await readDebugLogs("no-log-team", {});
+    expect(logs).toEqual([]);
+  });
+});
+
+describe("concurrent claim on blocked task", () => {
+  it("both concurrent claims on a blocked task return ok:false with blocked reason", async () => {
+    const prereqId = "task_prereq_blocked";
+    const blockedId = "task_blocked";
+    const team = makeTeam({
+      tasks: {
+        [prereqId]: {
+          id: prereqId,
+          title: "Prereq",
+          description: "Not done yet",
+          status: "in_progress",
+          assignee: "alice",
+          dependsOn: [],
+          createdAt: new Date().toISOString(),
+        },
+        [blockedId]: {
+          id: blockedId,
+          title: "Blocked Task",
+          description: "Waiting on prereq",
+          status: "pending",
+          assignee: null,
+          dependsOn: [prereqId],
+          createdAt: new Date().toISOString(),
+        },
+      },
+    });
+    await writeTeam(team);
+
+    const [r1, r2] = await Promise.all([
+      claimTask("test-team", blockedId, "alice"),
+      claimTask("test-team", blockedId, "bob"),
+    ]);
+
+    expect(r1.ok).toBe(false);
+    expect(r2.ok).toBe(false);
+    expect(r1.reason).toContain("blocked");
+    expect(r2.reason).toContain("blocked");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 1. updateMember patch mutation bug (BUG at state.ts:228-230)
+// ---------------------------------------------------------------------------
+describe("updateMember patch mutation bug", () => {
+  it("does not mutate the caller's patch object across calls", async () => {
+    const team = makeTeam({
+      members: {
+        alice: {
+          name: "alice",
+          sessionId: "sess-alice",
+          status: "ready",
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: "2026-01-01T00:00:00.000Z",
+        },
+      },
+    });
+    await writeTeam(team);
+
+    const patch: { status: "busy" } = { status: "busy" };
+    await updateMember("test-team", "alice", patch);
+
+    const result1 = await readTeam("test-team");
+    expect(result1?.members["alice"]?.status).toBe("busy");
+
+    await updateMember("test-team", "alice", patch);
+
+    const result2 = await readTeam("test-team");
+    expect(result2?.members["alice"]?.status).toBe("busy");
+    expect(patch).not.toHaveProperty("lastStatusAt");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2. claimTask ghost member (BUG at state.ts:323-329)
+// ---------------------------------------------------------------------------
+describe("claimTask ghost member", () => {
+  it("returns ok:true but does not write currentTask when assignee is not a member", async () => {
+    const team = makeTeam({
+      tasks: {
+        task_ghost: {
+          id: "task_ghost",
+          title: "Ghost Task",
+          description: "No such member",
+          status: "pending",
+          assignee: null,
+          dependsOn: [],
+          createdAt: new Date().toISOString(),
+        },
+      },
+    });
+    await writeTeam(team);
+
+    const result = await claimTask("test-team", "task_ghost", "ghost_member");
+    expect(result.ok).toBe(true);
+
+    const updated = await readTeam("test-team");
+    const ghostMember = updated?.members["ghost_member"];
+    expect(ghostMember).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3. retrying status in markStaleMembersAsError
+// ---------------------------------------------------------------------------
+describe("markStaleMembersAsError", () => {
+  it("marks retrying members as error and preserves previousStatus", async () => {
+    const team = makeTeam({
+      members: {
+        alice: {
+          name: "alice",
+          sessionId: "sess-alice",
+          status: "retrying",
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: new Date().toISOString(),
+        },
+      },
+    });
+    await writeTeam(team);
+
+    const recovered = await markStaleMembersAsError("test-team");
+    expect(recovered.length).toBe(1);
+    expect(recovered[0]?.memberName).toBe("alice");
+    expect(recovered[0]?.previousStatus).toBe("retrying");
+
+    const updated = await readTeam("test-team");
+    expect(updated?.members["alice"]?.status).toBe("error");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4. clear param of updateMember
+// ---------------------------------------------------------------------------
+describe("updateMember clear param", () => {
+  it("removes specified fields from the stored member", async () => {
+    const team = makeTeam({
+      members: {
+        alice: {
+          name: "alice",
+          sessionId: "sess-alice",
+          status: "busy",
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: "2026-01-01T00:00:00.000Z",
+          retryAttempt: 5,
+          retryNextMs: 1000,
+        },
+      },
+    });
+    await writeTeam(team);
+
+    await updateMember(
+      "test-team",
+      "alice",
+      {},
+      ["retryAttempt", "retryNextMs"],
+    );
+
+    const result = await readTeam("test-team");
+    expect(result?.members["alice"]).not.toHaveProperty("retryAttempt");
+    expect(result?.members["alice"]).not.toHaveProperty("retryNextMs");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5. Corrupt JSON vs ENOENT
+// ---------------------------------------------------------------------------
+describe("corrupt JSON vs ENOENT", () => {
+  it("readBulletinPosts throws on malformed JSON", async () => {
+    const team = makeTeam({ name: "corrupt-bul-team" });
+    await writeTeam(team);
+    const bulPath = path.join(teamDir("corrupt-bul-team"), "bulletin.jsonl");
+    await fs.mkdir(teamDir("corrupt-bul-team"), { recursive: true });
+    await fs.writeFile(bulPath, '{"broken\n', "utf-8");
+
+    await expect(readBulletinPosts("corrupt-bul-team")).rejects.toThrow();
+  });
+
+  it("getEvents throws on malformed JSON", async () => {
+    const team = makeTeam({ name: "corrupt-evt-team" });
+    await writeTeam(team);
+    const evtPath = path.join(teamDir("corrupt-evt-team"), "events.jsonl");
+    await fs.mkdir(teamDir("corrupt-evt-team"), { recursive: true });
+    await fs.writeFile(evtPath, '{"broken\n', "utf-8");
+
+    await expect(getEvents("corrupt-evt-team", 10)).rejects.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. findTeamBySession fast-path null after team deletion
+// ---------------------------------------------------------------------------
+describe("findTeamBySession fast-path null after team deletion", () => {
+  it("returns null without throwing when team directory is removed externally", async () => {
+    const team = makeTeam({ name: "delete-me-team", leadSessionId: "sess-delete" });
+    await writeTeam(team);
+
+    await fs.rm(teamDir("delete-me-team"), { recursive: true, force: true });
+
+    const result = await findTeamBySession("sess-delete");
+    expect(result).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. readDebugLogs fully untested
+// ---------------------------------------------------------------------------
+describe("readDebugLogs", () => {
+  it("reads and filters debug logs correctly", async () => {
+    const team = makeTeam({ name: "debug-log-team" });
+    await writeTeam(team);
+
+    const logDir = path.join(teamDir("debug-log-team"), "logs");
+    await fs.mkdir(logDir, { recursive: true });
+    const logPath = path.join(logDir, "debug.jsonl");
+
+    const entry1 =
+      JSON.stringify({
+        id: "log_1",
+        ts: "2026-01-01T00:00:00.000Z",
+        level: "info",
+        category: "status",
+        sessionId: "sess-alice",
+        teamName: "debug-log-team",
+        memberName: "alice",
+        correlationId: null,
+        message: "alice is ready",
+        context: {},
+      }) + "\n";
+
+    const entry2 =
+      JSON.stringify({
+        id: "log_2",
+        ts: "2026-01-01T00:01:00.000Z",
+        level: "error",
+        category: "status",
+        sessionId: "sess-bob",
+        teamName: "debug-log-team",
+        memberName: "bob",
+        correlationId: null,
+        message: "bob encountered an error",
+        context: {},
+      }) + "\n";
+
+    const entry3 =
+      JSON.stringify({
+        id: "log_3",
+        ts: "2026-01-01T00:02:00.000Z",
+        level: "info",
+        category: "status",
+        sessionId: "sess-alice",
+        teamName: "debug-log-team",
+        memberName: "alice",
+        correlationId: null,
+        message: "alice completed task",
+        context: {},
+      }) + "\n";
+
+    await fs.writeFile(logPath, entry1 + entry2 + entry3, "utf-8");
+
+    const { logs: all } = await readDebugLogs("debug-log-team", {});
+    expect(all.length).toBe(3);
+
+    const { logs: byLevel } = await readDebugLogs("debug-log-team", { level: "error" });
+    expect(byLevel.length).toBe(1);
+    expect(byLevel[0]?.level).toBe("error");
+
+    const { logs: bySessionId } = await readDebugLogs("debug-log-team", {
+      sessionId: "sess-alice",
+    });
+    expect(bySessionId.length).toBe(2);
+
+    const { logs: byMemberName } = await readDebugLogs("debug-log-team", {
+      memberName: "bob",
+    });
+    expect(byMemberName.length).toBe(1);
+    expect(byMemberName[0]?.memberName).toBe("bob");
+
+    const { logs: bySince } = await readDebugLogs("debug-log-team", {
+      since: "2026-01-01T00:01:30.000Z",
+    });
+    expect(bySince.length).toBe(1);
+    expect(bySince[0]?.id).toBe("log_3");
+
+    const { logs: byLimit } = await readDebugLogs("debug-log-team", { limit: 2 });
+    expect(byLimit.length).toBe(2);
+
+    const { logs: byLevelAndMember } = await readDebugLogs("debug-log-team", {
+      level: "info",
+      memberName: "alice",
+    });
+    expect(byLevelAndMember.length).toBe(2);
+  });
+
+  it("returns empty logs when file does not exist", async () => {
+    const team = makeTeam({ name: "no-log-team" });
+    await writeTeam(team);
+    const { logs } = await readDebugLogs("no-log-team", {});
+    expect(logs).toEqual([]);
   });
 });

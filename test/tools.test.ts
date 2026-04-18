@@ -864,3 +864,951 @@ describe("team_interrupt", () => {
     expect(result).toContain("delivered");
   });
 });
+
+// ---------------------------------------------------------------------------
+// team_broadcast
+// ---------------------------------------------------------------------------
+describe("team_broadcast", () => {
+  it("returns error when team not found", async () => {
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_broadcast", {
+      teamName: "ghost",
+      message: "Hello",
+    });
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("returns info message when sender is only active member", async () => {
+    await seedTeamWithMembers({ members: {} });
+    const tools = createTools(makeStubClient());
+    const result = await callTool(
+      tools,
+      "team_broadcast",
+      { teamName: "alpha", message: "Hello" },
+      "lead-session",
+    );
+    expect(result).toContain("no active members");
+    expect(result).not.toContain("Error");
+  });
+
+  it("broadcasts to all active members excluding sender", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(
+      tools,
+      "team_broadcast",
+      { teamName: "alpha", message: "All hands!" },
+      "lead-session",
+    );
+    expect(result).not.toContain("Error");
+    expect(result).toContain("alice");
+    expect(result).toContain("bob");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// team_shutdown
+// ---------------------------------------------------------------------------
+describe("team_shutdown", () => {
+  it("returns error when team not found", async () => {
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_shutdown", {
+      teamName: "ghost",
+    });
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("returns error when specific member not found", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_shutdown", {
+      teamName: "alpha",
+      memberName: "nobody",
+    });
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("shuts down a specific member", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_shutdown", {
+      teamName: "alpha",
+      memberName: "alice",
+    });
+    expect(result).not.toContain("Error");
+    expect(result).toContain("alice");
+    expect(result).toContain("Shutdown requested");
+  });
+
+  it("shuts down all active members when no member specified", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_shutdown", { teamName: "alpha" });
+    expect(result).not.toContain("Error");
+    expect(result).toContain("Shutdown requested");
+    expect(result).toContain("alice");
+    expect(result).toContain("bob");
+  });
+
+  it("returns message when no active members found", async () => {
+    await seedTeamWithMembers({
+      members: {
+        alice: {
+          name: "alice",
+          sessionId: "alice-sess",
+          status: "shutdown_requested",
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: new Date().toISOString(),
+        },
+      },
+    });
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_shutdown", { teamName: "alpha" });
+    expect(result).toContain("No members were shut down");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// team_task_update
+// ---------------------------------------------------------------------------
+describe("team_task_update", () => {
+  it("returns error when team not found", async () => {
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_task_update", {
+      teamName: "ghost",
+      taskId: "task_1",
+      title: "New title",
+    });
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("returns error when task not found", async () => {
+    await seedTeamWithTasks();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_task_update", {
+      teamName: "alpha",
+      taskId: "task_nonexistent",
+      title: "New title",
+    });
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("returns error when no fields provided", async () => {
+    await seedTeamWithTasks({
+      tasks: {
+        task_1: {
+          id: "task_1",
+          title: "Original",
+          description: "Desc",
+          status: "pending",
+          assignee: null,
+          dependsOn: [],
+          createdAt: new Date().toISOString(),
+        },
+      },
+    });
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_task_update", {
+      teamName: "alpha",
+      taskId: "task_1",
+    });
+    expect(result).toContain("Error");
+    expect(result).toContain("No fields to update");
+  });
+
+  it("updates title successfully", async () => {
+    await seedTeamWithTasks({
+      tasks: {
+        task_1: {
+          id: "task_1",
+          title: "Original",
+          description: "Desc",
+          status: "pending",
+          assignee: null,
+          dependsOn: [],
+          createdAt: new Date().toISOString(),
+        },
+      },
+    });
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_task_update", {
+      teamName: "alpha",
+      taskId: "task_1",
+      title: "Updated Title",
+    });
+    expect(result).not.toContain("Error");
+    expect(result).toContain("updated");
+    const team = await readTeam("alpha");
+    expect(team?.tasks["task_1"]?.title).toBe("Updated Title");
+  });
+
+  it("updates description successfully", async () => {
+    await seedTeamWithTasks({
+      tasks: {
+        task_1: {
+          id: "task_1",
+          title: "Title",
+          description: "Original desc",
+          status: "pending",
+          assignee: null,
+          dependsOn: [],
+          createdAt: new Date().toISOString(),
+        },
+      },
+    });
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_task_update", {
+      teamName: "alpha",
+      taskId: "task_1",
+      description: "New description",
+    });
+    expect(result).not.toContain("Error");
+    const team = await readTeam("alpha");
+    expect(team?.tasks["task_1"]?.description).toBe("New description");
+  });
+
+  it("updates assignee successfully", async () => {
+    await seedTeamWithTasks({
+      tasks: {
+        task_1: {
+          id: "task_1",
+          title: "Title",
+          description: "Desc",
+          status: "pending",
+          assignee: null,
+          dependsOn: [],
+          createdAt: new Date().toISOString(),
+        },
+      },
+    });
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_task_update", {
+      teamName: "alpha",
+      taskId: "task_1",
+      assignee: "alice",
+    });
+    expect(result).not.toContain("Error");
+    const team = await readTeam("alpha");
+    expect(team?.tasks["task_1"]?.assignee).toBe("alice");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// team_task_list
+// ---------------------------------------------------------------------------
+describe("team_task_list", () => {
+  it("returns error when team not found", async () => {
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_task_list", { teamName: "ghost" });
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("returns empty message when no tasks at all", async () => {
+    await seedTeamWithTasks();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_task_list", { teamName: "alpha" });
+    expect(result).toContain("No tasks found");
+  });
+
+  it("filters by pending status", async () => {
+    await seedTeamWithTasks({
+      tasks: {
+        task_1: {
+          id: "task_1",
+          title: "Pending task",
+          description: "Desc",
+          status: "pending",
+          assignee: null,
+          dependsOn: [],
+          createdAt: new Date().toISOString(),
+        },
+        task_2: {
+          id: "task_2",
+          title: "Completed task",
+          description: "Desc",
+          status: "completed",
+          assignee: null,
+          dependsOn: [],
+          createdAt: new Date().toISOString(),
+        },
+      },
+    });
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_task_list", {
+      teamName: "alpha",
+      status: "pending",
+    });
+    expect(result).toContain("pending");
+    expect(result).toContain("task_1");
+    expect(result).not.toContain("task_2");
+  });
+
+  it("filters by in_progress status", async () => {
+    await seedTeamWithTasks({
+      tasks: {
+        task_1: {
+          id: "task_1",
+          title: "In progress",
+          description: "Desc",
+          status: "in_progress",
+          assignee: "alice",
+          dependsOn: [],
+          createdAt: new Date().toISOString(),
+        },
+      },
+    });
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_task_list", {
+      teamName: "alpha",
+      status: "in_progress",
+    });
+    expect(result).toContain("in_progress");
+    expect(result).toContain("task_1");
+  });
+
+  it("filters by completed status", async () => {
+    await seedTeamWithTasks({
+      tasks: {
+        task_1: {
+          id: "task_1",
+          title: "Done",
+          description: "Desc",
+          status: "completed",
+          assignee: "alice",
+          dependsOn: [],
+          createdAt: new Date().toISOString(),
+        },
+      },
+    });
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_task_list", {
+      teamName: "alpha",
+      status: "completed",
+    });
+    expect(result).toContain("completed");
+    expect(result).toContain("task_1");
+  });
+
+  it("filters by blocked status", async () => {
+    await seedTeamWithTasks({
+      tasks: {
+        task_1: {
+          id: "task_1",
+          title: "Blocked",
+          description: "Desc",
+          status: "blocked",
+          assignee: null,
+          dependsOn: ["task_missing"],
+          createdAt: new Date().toISOString(),
+        },
+      },
+    });
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_task_list", {
+      teamName: "alpha",
+      status: "blocked",
+    });
+    expect(result).toContain("blocked");
+    expect(result).toContain("task_1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// team_member_info
+// ---------------------------------------------------------------------------
+describe("team_member_info", () => {
+  it("returns error when team not found", async () => {
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_member_info", {
+      teamName: "ghost",
+      memberName: "alice",
+    });
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("returns error when member not found", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_member_info", {
+      teamName: "alpha",
+      memberName: "nobody",
+    });
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("returns member info with active task", async () => {
+    await seedTeamWithTasks({
+      members: {
+        alice: {
+          name: "alice",
+          sessionId: "alice-sess",
+          status: "busy",
+          agentType: "backend engineer",
+          model: "claude-3",
+          spawnedAt: "2026-01-01T00:00:00.000Z",
+        },
+      },
+      tasks: {
+        task_1: {
+          id: "task_1",
+          title: "Build API",
+          description: "Implement it",
+          status: "in_progress",
+          assignee: "alice",
+          dependsOn: [],
+          createdAt: new Date().toISOString(),
+        },
+      },
+    });
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_member_info", {
+      teamName: "alpha",
+      memberName: "alice",
+    });
+    expect(result).toContain("alice");
+    expect(result).toContain("alice-sess");
+    expect(result).toContain("busy");
+    expect(result).toContain("Build API");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// team_member_session
+// ---------------------------------------------------------------------------
+describe("team_member_session", () => {
+  it("returns error when team not found", async () => {
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_member_session", {
+      teamName: "ghost",
+      memberName: "alice",
+    });
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("returns error when member not found", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_member_session", {
+      teamName: "alpha",
+      memberName: "nobody",
+    });
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("returns error when session.messages returns an error", async () => {
+    await seedTeamWithMembers();
+    const stubClient = {
+      session: {
+        create: makeStubClient().session.create,
+        promptAsync: makeStubClient().session.promptAsync,
+        messages: async () => ({
+          data: undefined,
+          error: { code: "SESSION_NOT_FOUND", message: "Session not found" },
+          request: new Request("http://localhost"),
+          response: new Response(),
+        }),
+        abort: makeStubClient().session.abort,
+      },
+    } as unknown as Parameters<typeof createTools>[0];
+    const tools = createTools(stubClient);
+    const result = await callTool(tools, "team_member_session", {
+      teamName: "alpha",
+      memberName: "alice",
+    });
+    expect(result).toContain("Error");
+    expect(result).toContain("SESSION_NOT_FOUND");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// team_logs
+// ---------------------------------------------------------------------------
+describe("team_logs", () => {
+  it("returns error when team not found", async () => {
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_logs", { teamName: "ghost" });
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("returns empty message when no logs", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_logs", { teamName: "alpha" });
+    expect(result).toContain("No debug logs found");
+  });
+
+  it("filters by level", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_logs", {
+      teamName: "alpha",
+      level: "error",
+    });
+    expect(result).toContain("No debug logs found");
+  });
+
+  it("filters by sessionId", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_logs", {
+      teamName: "alpha",
+      sessionId: "some-session-id",
+    });
+    expect(result).toContain("No debug logs found");
+  });
+
+  it("filters by memberName", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_logs", {
+      teamName: "alpha",
+      memberName: "alice",
+    });
+    expect(result).toContain("No debug logs found");
+  });
+
+  it("filters by since", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_logs", {
+      teamName: "alpha",
+      since: "2026-01-01T00:00:00.000Z",
+    });
+    expect(result).toContain("No debug logs found");
+  });
+
+  it("respects limit parameter", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_logs", {
+      teamName: "alpha",
+      limit: 5,
+    });
+    expect(result).toContain("No debug logs found");
+  });
+
+  it("combines multiple filters", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_logs", {
+      teamName: "alpha",
+      level: "info",
+      memberName: "alice",
+      limit: 10,
+    });
+    expect(result).toContain("No debug logs found");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// team_bulletin_post
+// ---------------------------------------------------------------------------
+describe("team_bulletin_post", () => {
+  it("returns error when team not found", async () => {
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_bulletin_post", {
+      teamName: "ghost",
+      category: "finding",
+      title: "Test",
+      body: "Body text",
+    });
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("posts a finding successfully", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(
+      tools,
+      "team_bulletin_post",
+      {
+        teamName: "alpha",
+        category: "finding",
+        title: "API design decision",
+        body: "Use REST over GraphQL for simplicity.",
+      },
+      "alice-sess",
+    );
+    expect(result).not.toContain("Error");
+    expect(result).toContain("Bulletin post created");
+  });
+
+  it("posts a blocker successfully", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(
+      tools,
+      "team_bulletin_post",
+      {
+        teamName: "alpha",
+        category: "blocker",
+        title: "Missing auth credentials",
+        body: "Cannot proceed without the API keys.",
+      },
+      "alice-sess",
+    );
+    expect(result).not.toContain("Error");
+    expect(result).toContain("Bulletin post created");
+  });
+
+  it("posts a question successfully", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(
+      tools,
+      "team_bulletin_post",
+      {
+        teamName: "alpha",
+        category: "question",
+        title: "Which endpoint for auth?",
+        body: "Should we use /auth/login or /auth/token?",
+      },
+      "bob-sess",
+    );
+    expect(result).not.toContain("Error");
+    expect(result).toContain("Bulletin post created");
+  });
+
+  it("posts an update successfully", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(
+      tools,
+      "team_bulletin_post",
+      {
+        teamName: "alpha",
+        category: "update",
+        title: "API endpoint complete",
+        body: "Finished the auth endpoints ahead of schedule.",
+      },
+      "alice-sess",
+    );
+    expect(result).not.toContain("Error");
+    expect(result).toContain("Bulletin post created");
+  });
+
+  it("persists the post so it can be read back", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    await callTool(
+      tools,
+      "team_bulletin_post",
+      {
+        teamName: "alpha",
+        category: "finding",
+        title: "Persisted finding",
+        body: "This should survive a read.",
+      },
+      "alice-sess",
+    );
+    const readTools = createTools(makeStubClient());
+    const readResult = await callTool(readTools, "team_bulletin_read", {
+      teamName: "alpha",
+    });
+    expect(readResult).toContain("Persisted finding");
+    expect(readResult).toContain("FINDING");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// team_bulletin_read
+// ---------------------------------------------------------------------------
+describe("team_bulletin_read", () => {
+  it("returns error when team not found", async () => {
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_bulletin_read", {
+      teamName: "ghost",
+    });
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("returns empty message when no posts yet", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_bulletin_read", {
+      teamName: "alpha",
+    });
+    expect(result).toContain("No bulletin posts yet");
+  });
+
+  it("returns multiple posts ordered by timestamp", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    await callTool(
+      tools,
+      "team_bulletin_post",
+      {
+        teamName: "alpha",
+        category: "update",
+        title: "First post",
+        body: "This was posted first.",
+      },
+      "alice-sess",
+    );
+    await callTool(
+      tools,
+      "team_bulletin_post",
+      {
+        teamName: "alpha",
+        category: "finding",
+        title: "Second post",
+        body: "This was posted second.",
+      },
+      "bob-sess",
+    );
+
+    const result = await callTool(tools, "team_bulletin_read", {
+      teamName: "alpha",
+    });
+    expect(result).toContain("Bulletin board:");
+    expect(result).toContain("First post");
+    expect(result).toContain("Second post");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// team_timeline
+// ---------------------------------------------------------------------------
+describe("team_timeline", () => {
+  it("returns error when team not found", async () => {
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_timeline", { teamName: "ghost" });
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("returns empty timeline message when no events", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_timeline", { teamName: "alpha" });
+    expect(result).toContain("No activity recorded yet");
+  });
+
+  it("shows mixed events (message + task) in timeline", async () => {
+    await seedTeamWithMembers();
+    await appendEvent("alpha", {
+      type: "message",
+      sender: "alice",
+      senderId: "alice-sess",
+      content: "Starting work",
+    });
+    await appendEvent("alpha", {
+      type: "task",
+      sender: "alice",
+      senderId: "alice-sess",
+      content: "claimed task task_1",
+      targetId: "task_1",
+    });
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_timeline", { teamName: "alpha" });
+    expect(result).toContain("Timeline for");
+    expect(result).toContain("alice");
+    expect(result).toContain("Starting work");
+    expect(result).toContain("claimed task");
+  });
+
+  it("respects limit parameter", async () => {
+    await seedTeamWithMembers();
+    for (let i = 0; i < 5; i++) {
+      await appendEvent("alpha", {
+        type: "message",
+        sender: "alice",
+        senderId: "alice-sess",
+        content: `Event ${i}`,
+      });
+    }
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_timeline", {
+      teamName: "alpha",
+      limit: 2,
+    });
+    expect(result).toContain("Timeline for");
+    expect(result).not.toContain("Event 0");
+    expect(result).not.toContain("Event 1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// team_prune
+// ---------------------------------------------------------------------------
+describe("team_prune", () => {
+  it("returns error when team not found", async () => {
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_prune", { teamName: "ghost" });
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("reports zero pruned when no events", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_prune", { teamName: "alpha" });
+    expect(result).not.toContain("Error");
+    expect(result).toContain("Pruned 0");
+    expect(result).toContain("0 events remaining");
+  });
+
+  it("reports correct prune count accuracy", async () => {
+    await seedTeamWithMembers();
+    for (let i = 0; i < 5; i++) {
+      await appendEvent("alpha", {
+        type: "message",
+        sender: "alice",
+        senderId: "alice-sess",
+        content: `Event ${i}`,
+      });
+    }
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_prune", {
+      teamName: "alpha",
+      keep: 3,
+    });
+    expect(result).not.toContain("Error");
+    expect(result).toContain("Pruned 2");
+    expect(result).toContain("3 events remaining");
+  });
+
+  it("handles keep=0 edge case", async () => {
+    await seedTeamWithMembers();
+    for (let i = 0; i < 3; i++) {
+      await appendEvent("alpha", {
+        type: "message",
+        sender: "alice",
+        senderId: "alice-sess",
+        content: `Event ${i}`,
+      });
+    }
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_prune", {
+      teamName: "alpha",
+      keep: 0,
+    });
+    expect(result).not.toContain("Error");
+    expect(result).toContain("Pruned 3");
+    expect(result).toContain("0 events remaining");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// team_list
+// ---------------------------------------------------------------------------
+describe("team_list", () => {
+  it("returns empty message when no teams at all", async () => {
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_list", {});
+    expect(result).toContain("No teams exist yet");
+  });
+
+  it("lists multiple teams with varied member/task counts", async () => {
+    await writeTeam({
+      name: "team-a",
+      leadSessionId: "lead-a",
+      members: {
+        alice: {
+          name: "alice",
+          sessionId: "alice-sess",
+          status: "ready",
+          agentType: "default",
+          model: "claude-3",
+          spawnedAt: new Date().toISOString(),
+        },
+      },
+      tasks: {
+        task_1: {
+          id: "task_1",
+          title: "Task A",
+          description: "Desc",
+          status: "pending",
+          assignee: null,
+          dependsOn: [],
+          createdAt: new Date().toISOString(),
+        },
+      },
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    await writeTeam({
+      name: "team-b",
+      leadSessionId: "lead-b",
+      members: {},
+      tasks: {},
+      createdAt: "2026-01-02T00:00:00.000Z",
+    });
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_list", {});
+    expect(result).toContain("Teams:");
+    expect(result).toContain("team-a");
+    expect(result).toContain("team-b");
+    expect(result).toContain("1 member(s)");
+    expect(result).toContain("0 member(s)");
+    expect(result).toContain("1 task(s)");
+    expect(result).toContain("0 task(s)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// team_delete
+// ---------------------------------------------------------------------------
+describe("team_delete", () => {
+  it("returns error when team not found", async () => {
+    const tools = createTools(makeStubClient());
+    const result = await callTool(tools, "team_delete", { teamName: "ghost" });
+    expect(result).toContain("Error");
+    expect(result).toContain("not found");
+  });
+
+  it("returns error when non-lead attempts deletion", async () => {
+    await seedTeamWithMembers({ leadSessionId: "lead-session" });
+    const tools = createTools(makeStubClient());
+    const result = await callTool(
+      tools,
+      "team_delete",
+      { teamName: "alpha" },
+      "alice-sess",
+    );
+    expect(result).toContain("Error");
+    expect(result).toContain("Only the team lead can delete");
+  });
+
+  it("returns warning when team has active members", async () => {
+    await seedTeamWithMembers();
+    const tools = createTools(makeStubClient());
+    const result = await callTool(
+      tools,
+      "team_delete",
+      { teamName: "alpha" },
+      "lead-session",
+    );
+    expect(result).toContain("Warning");
+    expect(result).toContain("active member(s)");
+    expect(result).toContain("Shutdown members first");
+  });
+
+  it("deletes team successfully when no members", async () => {
+    await seedTeamWithMembers({ members: {} });
+    const tools = createTools(makeStubClient());
+    const result = await callTool(
+      tools,
+      "team_delete",
+      { teamName: "alpha" },
+      "lead-session",
+    );
+    expect(result).not.toContain("Error");
+    expect(result).toContain("deleted");
+    const team = await readTeam("alpha");
+    expect(team).toBeNull();
+  });
+});
