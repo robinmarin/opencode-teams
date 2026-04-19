@@ -1,6 +1,6 @@
 {
   "name": "@robinmarin/opencode-teams",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "OpenCode plugin — spawn and coordinate sub-agent teams from your lead session",
   "type": "module",
   "main": "./dist/index.js",
